@@ -1,2 +1,2 @@
 """IBKR Portfolio Tracker - turns Interactive Brokers Activity Statements into a formula-driven Excel workbook."""
-__version__ = "1.3.0"
+__version__ = "1.4.0"

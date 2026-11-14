@@ -4,7 +4,13 @@ Works completely offline: prices and FX come from the statements themselves (the
 empty until *Refresh Prices* has downloaded data).  When the statements belong to more than one account, the
 consolidated (all accounts merged) workbook ``IBKR_Portfolio_ALL_sample.xlsx`` is written as well, and every account
 also gets ``IBKR_Portfolio_<account>_sample_filtered.xlsx`` - the same workbook with the *hide closed positions and
-dust balances* filter on (Sections 6 and 7 without the empty USD / EUR balances; the totals are identical).  Usage::
+dust balances* filter on (Sections 6 and 7 without the empty USD / EUR balances; the totals are identical).
+
+The *Allocation* sheet needs an industry sector per stock, which IBKR statements do not contain and which is normally
+looked up at Yahoo Finance (not possible offline).  The example therefore types the sectors of the six sample stocks in
+as "your own classification" (:data:`SAMPLE_SECTORS`, Yahoo Finance's names) - exactly what the classification editor of
+the app does.  The *Risk* sheet needs daily prices, so in this offline example it only says that they are missing.
+Usage::
 
     python scripts/make_sample_workbook.py
 """
@@ -23,6 +29,16 @@ from ibkr_tracker.portfolio import CONSOLIDATED                    # noqa: E402
 from ibkr_tracker.storage import Store                             # noqa: E402
 from ibkr_tracker.tracker import Tracker                           # noqa: E402
 
+# the user's own sector entries for the stocks of the sample statements ("TICKER|CCY": {"sector": ...})
+SAMPLE_SECTORS = {
+    "AMZN|USD": {"sector": "Consumer Cyclical"},
+    "BN|USD": {"sector": "Financial Services"},
+    "GOOGL|USD": {"sector": "Communication Services"},
+    "META|USD": {"sector": "Communication Services"},
+    "MSFT|USD": {"sector": "Technology"},
+    "NVO|USD": {"sector": "Healthcare"},
+}
+
 
 def main() -> int:
     statements = sorted((ROOT / "examples" / "statements").iterdir())
@@ -30,7 +46,8 @@ def main() -> int:
     target_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ibkr_sample_") as tmp:
         t = Tracker(Store(Path(tmp) / "tracker.db"))
-        t.update_settings(price_source="statement", output_dir=tmp, recalc_with_libreoffice=True, export_excel=True)
+        t.update_settings(price_source="statement", output_dir=tmp, recalc_with_libreoffice=True, export_excel=True,
+                          classification=SAMPLE_SECTORS)
         accounts = set()
         for f in statements:
             res = t.import_statement(f.name, f.read_bytes())

@@ -83,7 +83,8 @@ def test_dashboard_for_the_imported_account(gui):
     assert [x for x in labels if x[0].isdigit()] == ["1 · Stock transactions (+ 5 · extensions)", "2 · Dividends",
                                                      "3 · Deposits & withdrawals", "4 · Forex"]
     assert labels[labels.index("Dashboard") + 1:labels.index("Transactions")] == [
-        "Value & deposits", "Gain", "Return", "CAGR", "vs. VUAA", "Allocation"]               # the history charts
+        "Value & deposits", "Gain", "Return", "CAGR", "vs. VUAA", "Allocation",              # the history charts
+        "Allocation breakdown", "Risk & return"]                                             # the portfolio analysis
     assert labels[labels.index("Market data") + 1:labels.index("Archive")] == [
         "Prices & overrides", "Ticker mapping", "Manual price history", "Paste text", "Upload a file", "Type rows",
         "Price coverage"]
@@ -415,6 +416,7 @@ def test_a_stock_can_be_set_to_manual_prices_only(gui):
 
 def test_testing_a_symbol_and_using_it(gui):
     t, fake, home = gui
+    fake.last_day = None          # the test asks for the last 14 days up to the real today; the fixture's series stops on a fixed day
     at = new_app().run()
     widget(at, "selectbox", "map_test_stock").set_value("NVO (USD)").run()
     widget(at, "text_input", "map_test_symbol").set_value("nvo.mx").run()

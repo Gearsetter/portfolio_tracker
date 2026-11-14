@@ -6,6 +6,8 @@ from typing import Optional
 
 import pandas as pd
 
+from . import analytics
+from .allocation import GROUPINGS, Allocation, Concentration, Holding
 from .calc import Metrics
 from .history import COLUMNS as HISTORY_COLUMNS
 from .history import MIN_CAGR_YEARS, History
@@ -300,3 +302,120 @@ def manual_prices_table(portfolio: Portfolio, summary: dict, benchmark_key: str,
                      "From": day(info.get("first")), "To": day(info.get("last")), "Source": info.get("source", ""),
                      "Entered": str(info.get("imported_at", "")).replace("T", " ")[:16]})
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# portfolio analysis: allocation (donut chart) and risk metrics
+# ---------------------------------------------------------------------------------------------------------------
+def allocation_table(a: Allocation) -> pd.DataFrame:
+    """The slices of one grouping: USD value, weight (a fraction of the positive values) and the holdings in it."""
+    label = GROUPINGS[a.by]
+    return pd.DataFrame([{label: s.label, "USD Value": s.usd_value, "Weight": s.weight, "Holdings": len(s.members),
+                          "Members": ", ".join(s.members)} for s in a.slices])
+
+
+def allocation_long_table(allocations: list[Allocation]) -> pd.DataFrame:
+    """Every grouping stacked (``allocation.csv``): ``Grouping, Group, USD Value, Weight, Holdings, Members``."""
+    rows = []
+    for a in allocations:
+        for s in a.slices:
+            rows.append({"Grouping": GROUPINGS[a.by], "Group": s.label, "USD Value": s.usd_value, "Weight": s.weight,
+                         "Holdings": len(s.members), "Members": ", ".join(s.members)})
+    return pd.DataFrame(rows)
+
+
+def concentration_cards(c: Concentration) -> list[tuple[str, Optional[float], str]]:
+    """``(label, value, kind)`` of the concentration figures - kind ``"pct"``, ``"count"`` or ``"number"``."""
+    return [("Stock positions", float(c.n_positions), "count"),
+            (f"Largest position{f' ({c.largest_ticker})' if c.largest_ticker else ''}", c.largest_weight, "pct"),
+            ("Top 3 positions", c.top3_weight, "pct"), ("Top 5 positions", c.top5_weight, "pct"),
+            ("Effective positions", c.effective_positions, "number")]
+
+
+def classification_table(holdings: list[Holding]) -> pd.DataFrame:
+    """The classification editor: the stocks with their asset class and sector (the two editable columns) and where
+    each of them comes from.  Cash is not listed - it is always *Cash*."""
+    total = sum(h.usd_value for h in holdings if h.usd_value > 0)
+    return pd.DataFrame([{
+        "Ticker": h.ticker, "Currency": h.currency, "Name": h.name, "Statement type": h.ibkr_type or "-",
+        "USD Value": h.usd_value, "Weight": (h.usd_value / total) if total > 0 and h.usd_value > 0 else None,
+        "Asset class": h.asset_class, "Sector": h.sector, "Sector from": h.sector_source}
+        for h in holdings if not h.is_cash])
+
+
+def holdings_table(holdings: list[Holding]) -> pd.DataFrame:
+    """Every holding with its classification (``holdings.csv``)."""
+    total = sum(h.usd_value for h in holdings if h.usd_value > 0)
+    return pd.DataFrame([{
+        "Holding": h.ticker, "Currency": h.currency, "Name": h.name, "Statement type": h.ibkr_type,
+        "Asset class": h.asset_class, "Stock type": h.stock_type, "Sector": h.sector, "Industry": h.industry,
+        "USD Value": h.usd_value, "Weight": (h.usd_value / total) if total > 0 and h.usd_value > 0 else None}
+        for h in holdings])
+
+
+def _fmt_metric(v, kind: str) -> str:
+    if v is None or (isinstance(v, float) and v != v):
+        return "n/a"
+    if kind == analytics.PCT:
+        return f"{v * 100:.2f}%"
+    if kind == analytics.RATIO:
+        return f"{v:.2f}"
+    if kind == analytics.NUMBER:
+        return f"{v:,.2f}"
+    return str(v) if v != "" else "n/a"
+
+
+def risk_table(rep: analytics.RiskReport) -> pd.DataFrame:
+    """The metrics table of the dashboard (formatted text): ``Group, Metric, Portfolio, Benchmark, What it means``."""
+    bench = f"Benchmark ({rep.benchmark_symbol})" if rep.benchmark_symbol else "Benchmark"
+    return pd.DataFrame([{
+        "Group": r.group, "Metric": r.label, "Portfolio": _fmt_metric(r.portfolio, r.kind),
+        bench: _fmt_metric(r.benchmark, r.kind), "What it means": r.help} for r in rep.rows()])
+
+
+def risk_values_table(rep: analytics.RiskReport) -> pd.DataFrame:
+    """The metrics as numbers (``risk_metrics.csv``): percentages are fractions (0.1234 = 12.34 %)."""
+    fmt = {analytics.PCT: "percent (as a fraction)", analytics.RATIO: "ratio", analytics.NUMBER: "number",
+           analytics.TEXT: "text"}
+    return pd.DataFrame([{
+        "Currency": rep.currency, "Group": r.group, "Metric": r.label, "Portfolio": r.portfolio,
+        "Benchmark": r.benchmark, "Format": fmt.get(r.kind, r.kind), "Window start": rep.start, "Window end": rep.end,
+        "Observation days": rep.n_obs, "Risk-free rate": rep.risk_free} for r in rep.rows()])
+
+
+RISK_DAILY_COLUMNS = {
+    "value": "Value", "flow": "Net deposits of the day", "ret": "Return", "index": "Wealth index", "peak": "Peak",
+    "drawdown": "Drawdown", "rolling_vol": f"Rolling volatility ({analytics.ROLLING_WINDOW} days)",
+    "bench_price": "Benchmark price", "bench_ret": "Benchmark return", "bench_index": "Benchmark wealth index",
+    "bench_drawdown": "Benchmark drawdown"}
+
+
+def risk_daily_table(rep: analytics.RiskReport) -> pd.DataFrame:
+    """One row per observation day (``risk_daily.csv``) - the numbers behind the drawdown and volatility charts."""
+    if rep.frame.empty:
+        return pd.DataFrame()
+    out = rep.frame[list(RISK_DAILY_COLUMNS)].rename(columns=RISK_DAILY_COLUMNS).copy()
+    out.index = [t.date().isoformat() for t in out.index]
+    out.index.name = "Date"
+    out.insert(0, "Currency", rep.currency)
+    return out.reset_index()
+
+
+def risk_chart_frame(rep: analytics.RiskReport, kind: str) -> pd.DataFrame:
+    """Chart data of a report: ``kind`` = ``"drawdown"`` | ``"rolling_vol"`` (percent, portfolio and benchmark columns)."""
+    f = rep.frame
+    if f.empty:
+        return pd.DataFrame()
+    bench = (rep.benchmark_symbol or "Benchmark").split(".")[0]
+    if kind == "drawdown":
+        cols = {"drawdown": "Portfolio", "bench_drawdown": bench}
+        data = f[[c for c in cols if c in f]].rename(columns=cols) * 100.0
+    elif kind == "rolling_vol":
+        data = pd.DataFrame({"Portfolio": f["rolling_vol"] * 100.0})
+        rb = f["bench_ret"].rolling(analytics.ROLLING_WINDOW, min_periods=analytics.ROLLING_WINDOW).std()
+        if rb.notna().any():
+            data[bench] = rb * (analytics.TRADING_DAYS ** 0.5) * 100.0
+    else:
+        raise ValueError(f"unknown chart {kind!r}")
+    data.index.name = "Date"
+    return data.dropna(axis=1, how="all")

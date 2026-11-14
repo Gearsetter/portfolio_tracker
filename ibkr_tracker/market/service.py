@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Callable, Iterable, Optional
 
-from ..portfolio import Portfolio, is_closed
+from ..portfolio import Portfolio, is_closed, is_fund_type
 from ..storage import Store
 from .data import (SOURCE_LABEL, SRC_MANUAL, SRC_STATEMENT, SRC_YAHOO, BenchSeries, FxSeries, FxTable, MarketData,
                    PricePoint, PriceSeries, merge_series)
@@ -54,6 +54,41 @@ class RefreshReport:
         if self.skipped:
             s += f"; {len(self.skipped)} skipped"
         return s + "."
+
+
+@dataclass
+class ProfileReport:
+    """Result of the sector lookup (*Look up sectors* in the dashboard) - what Yahoo Finance said about each stock."""
+    found: dict[str, str] = field(default_factory=dict)         # "TICKER|CCY" -> sector
+    no_sector: list[str] = field(default_factory=list)          # Yahoo knows the instrument but reports no sector
+    errors: dict[str, str] = field(default_factory=dict)        # "TICKER|CCY" -> message
+    cached: list[str] = field(default_factory=list)             # already known - not asked again
+    skipped: list[str] = field(default_factory=list)            # funds, manual-only stocks, stocks you classified yourself
+    offline: bool = False                                        # price source is 'statements only'
+    unsupported: bool = False                                    # the price provider cannot look sectors up
+    aborted: bool = False                                        # gave up early: Yahoo is evidently unreachable
+    answered: int = 0
+    messages: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not (self.errors or self.offline or self.unsupported)
+
+    def summary(self) -> str:
+        if self.offline:
+            return "Price source is 'statements only' - no sector lookup was made. Switch to Yahoo Finance in the sidebar."
+        if self.unsupported:
+            return "The price provider cannot look up sectors."
+        parts = [f"{len(self.found)} sector(s) found"]
+        if self.no_sector:
+            parts.append(f"{len(self.no_sector)} without a sector at Yahoo")
+        if self.errors:
+            parts.append(f"{len(self.errors)} failed")
+        if self.cached:
+            parts.append(f"{len(self.cached)} already known")
+        if self.skipped:
+            parts.append(f"{len(self.skipped)} skipped (funds, manual-only or classified by you)")
+        return "Sector lookup: " + ", ".join(parts) + "."
 
 
 STALE_PRICE_DAYS = 10           # a held stock priced this many days before the valuation date gets a warning
@@ -159,6 +194,71 @@ class MarketDataService:
             self.store.kv_set("last_refresh", datetime.now().isoformat(timespec="seconds"))
         report.finished = datetime.now()
         return report
+
+    # ---- sectors (network, on request) -----------------------------------------------------------------
+    def refresh_profiles(self, portfolio: Portfolio, settings: dict,
+                         progress: Optional[Callable[[int, int, str], None]] = None,
+                         force: bool = False) -> ProfileReport:
+        """Ask the provider for the sector of every stock held now and cache the answers (``force``: ask again for the
+        ones that are already known).  Funds (a fund has no sector), manual-only stocks and stocks the user has already
+        given a sector are left out.  It is an explicit action - *Refresh Prices* never calls it."""
+        report = ProfileReport()
+        if settings.get("price_source", "yahoo") != "yahoo":
+            report.offline = True
+            return report
+        lookup = getattr(self.provider, "profile", None)
+        if not callable(lookup):
+            report.unsupported = True
+            return report
+        held = portfolio.net_quantities()
+        mine = settings.get("classification") or {}
+        skip_download = self.manual_only(settings)
+        cache = self.store.get_profiles()
+        todo: list[tuple[str, str]] = []
+        for ticker, ccy in portfolio.positions_keys():
+            if is_closed(held.get((ticker, ccy), 0.0)):
+                continue
+            key = f"{ticker}|{ccy}"
+            inst = portfolio.instruments.get(ticker)
+            entry = mine.get(key) or mine.get(ticker) or {}
+            if (key in skip_download or is_fund_type(inst.type if inst else "")
+                    or (isinstance(entry, dict) and entry.get("sector"))):
+                report.skipped.append(key)
+                continue
+            sym = self.symbol_for(portfolio, settings, ticker, ccy)
+            known = cache.get(key)
+            if not force and known and known["symbol"] == sym and known["sector"]:
+                report.cached.append(key)
+                continue
+            todo.append((key, sym))
+        for i, (key, sym) in enumerate(todo):
+            if not report.answered and len(report.errors) >= self.GIVE_UP_AFTER:
+                report.aborted = True
+                report.messages.append(
+                    f"Yahoo Finance could not be reached ({self.GIVE_UP_AFTER} lookups failed in a row) - the remaining "
+                    f"{len(todo) - i} stock(s) were not asked. Check the internet connection and try again, or type the "
+                    "sectors in yourself.")
+                break
+            if progress:
+                progress(i, len(todo), sym)
+            try:
+                res = lookup(sym)
+                report.answered += 1
+                self.store.save_profile(key, sym, res.sector, res.industry, res.quote_type, res.name)
+                if res.sector:
+                    report.found[key] = res.sector
+                else:
+                    report.no_sector.append(key)
+            except Exception as exc:                                  # noqa: BLE001 - never crash the GUI
+                report.errors[key] = str(exc) if isinstance(exc, ProviderError) else repr(exc)
+        if progress:
+            progress(len(todo), len(todo), "")
+        return report
+
+    def cached_profiles(self, symbols: dict[str, str]) -> dict[str, dict]:
+        """The cached profiles that belong to the symbols in use (``{"TICKER|CCY": symbol}``) - a profile that was looked
+        up for another symbol (the mapping changed since) is not trusted."""
+        return {k: v for k, v in self.store.get_profiles().items() if k in symbols and v["symbol"] == symbols[k]}
 
     # ---- assemble (no network) -------------------------------------------------------------------------
     def build(self, portfolio: Portfolio, settings: dict) -> MarketData:
@@ -318,4 +418,4 @@ class MarketDataService:
             fx_overrides=fx_over, benchmark=bench, benchmark_override=bench_over, as_of=as_of, mode=mode,
             yahoo_symbols=symbols, missing_fx=missing, notes=notes,
             last_refresh=self.store.kv_get("last_refresh") or "", price_series=series_by_key,
-            manual_keys=manual_keys)
+            manual_keys=manual_keys, profiles=self.cached_profiles(symbols))

@@ -55,7 +55,8 @@ def built(pf_synth):
 
 def test_the_workbook_has_a_history_sheet_next_to_the_market_data(built):
     wb, _, _ = built
-    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "History", "Checks", "About", "_state"]
+    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "History", "Allocation", "Risk", "RiskData", "Checks", "About",
+                           "_state"]
 
 
 def test_every_day_and_every_column_of_the_reconstruction_is_on_the_sheet(built):
@@ -233,7 +234,8 @@ def test_a_workbook_from_before_the_history_sheet_gets_it_on_the_next_refresh(tr
     out = tr.refresh_prices(ACCOUNT)
     assert out.ok and out.update.action == "updated" and out.update.backup is None        # not rebuilt, nothing lost
     wb = openpyxl.load_workbook(path)
-    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "History", "Checks", "About", "_state"]
+    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "History", "Allocation", "Risk", "RiskData", "Checks", "About",
+                           "_state"]
     assert len(history_of(path)[1]) == out.snapshot.history().days
 
 
@@ -283,8 +285,10 @@ def test_the_last_day_of_the_history_equals_the_formula_totals_of_the_portfolio_
 # ======================================================================================================
 @pytest.fixture(scope="module")
 def snap(pf_synth, tmp_path_factory):
-    store = Store(tmp_path_factory.mktemp("csv") / "t.db")
-    store.save_settings(dict(DEFAULT_SETTINGS))
+    folder = tmp_path_factory.mktemp("csv")
+    store = Store(folder / "t.db")
+    # (a module-scoped fixture is not covered by the autouse safety net of conftest: keep the workbook out of ./data)
+    store.save_settings(dict(DEFAULT_SETTINGS, output_dir=str(folder)))
     t = Tracker(store, FakeProvider(last_day=TODAY), today=lambda: TODAY)
     assert t.import_statement("synthetic.csv", make_csv()[0]).ok
     t.refresh_prices(ACCOUNT)

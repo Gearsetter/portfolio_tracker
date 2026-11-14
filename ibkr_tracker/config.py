@@ -23,6 +23,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "consolidated_base": "",           # base currency of the all-accounts view; empty = common base currency, else USD
     "csv_format": "international",     # CSV dialect: "international" (, and .) | "european" (; and decimal comma)
     "hide_closed_dust": False,         # view filter: hide positions with 0 shares and cash balances below 0.5
+    "classification": {},              # "TICKER|CCY" -> {"asset_class": ..., "sector": ...}: the user's own entries
+    "risk_free": {},                   # "CCY" -> annual risk-free rate in percent (Sharpe / Sortino / alpha); empty = 0
 }
 
 

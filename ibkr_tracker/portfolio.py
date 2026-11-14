@@ -96,6 +96,13 @@ def is_dust(balance: float) -> bool:
     return abs(balance) < DUST_THRESHOLD
 
 
+def is_fund_type(ibkr_type: str) -> bool:
+    """``True`` for the *Type* of an exchange-traded or ordinary fund in the statement's instrument information
+    (``ETF``, ``ETN``, ``MUTUAL FUND``, ``CLOSED-END FUND`` ...): a fund has no industry sector."""
+    t = (ibkr_type or "").upper()
+    return any(word in t for word in ("ETF", "ETN", "FUND"))
+
+
 @dataclass
 class Portfolio:
     account: str

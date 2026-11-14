@@ -162,6 +162,9 @@ class MarketData:
     # full daily history of every stock ("TICKER|CCY" -> merged series); feeds the day-by-day reconstruction
     price_series: dict[str, PriceSeries] = field(default_factory=dict)
     manual_keys: list[str] = field(default_factory=list)        # stocks that have a manual price history
+    # cached Yahoo profiles of the stocks ("TICKER|CCY" -> {sector, industry, quote_type, name, symbol}); looked up on
+    # request - they only feed the sector view of the allocation, never a valuation
+    profiles: dict[str, dict] = field(default_factory=dict)
 
     # ---- accessors ---------------------------------------------------------------------------------------
     def price(self, ticker: str, ccy: str) -> Optional[float]:

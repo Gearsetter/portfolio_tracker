@@ -135,6 +135,7 @@ class History:
     benchmark_symbol: str = ""
     benchmark_available: bool = False
     benchmark_priced: bool = False                   # the benchmark has prices (False = nothing could be downloaded)
+    position_keys: dict[str, str] = field(default_factory=dict)      # label of a ``positions`` column -> "TICKER|CCY"
 
     @property
     def empty(self) -> bool:
@@ -406,11 +407,12 @@ def build_history(portfolio: Portfolio, md: MarketData, metrics: Optional[Metric
     labels = {k: (k.split("|")[0] if tickers.count(k.split("|")[0]) == 1 else f"{k.split('|')[0]} ({k.split('|')[1]})")
               for k in pos_usd}
     positions = pd.DataFrame({labels[k]: v for k, v in pos_usd.items() if any(abs(x) > 1e-9 for x in v)}, index=index)
+    position_keys = {labels[k]: k for k, v in pos_usd.items() if any(abs(x) > 1e-9 for x in v)}
 
     priced = bool(md.benchmark.dates)
     hist = History(base, start, end, frame, positions, [p.cov for p in pos if p.cov.held_days or p.cov.points],
                    benchmark_symbol=md.benchmark.symbol, benchmark_available=bench_ok and priced,
-                   benchmark_priced=priced)
+                   benchmark_priced=priced, position_keys=position_keys)
     downloaded = any(SRC_YAHOO in ser.sources or SRC_MANUAL in ser.sources for ser in md.price_series.values())
     hist.notes = _notes(hist, fx_missing, downloaded)
     return hist

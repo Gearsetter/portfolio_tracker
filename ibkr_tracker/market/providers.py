@@ -30,8 +30,28 @@ class SeriesResult:
     notes: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ProfileResult:
+    """What a data provider knows about an instrument besides its prices: the sector and industry of a stock."""
+    symbol: str
+    sector: str = ""                        # Yahoo's sector name ("Technology", "Healthcare" ...); empty for funds
+    industry: str = ""
+    quote_type: str = ""                    # Yahoo's quoteType in upper case: EQUITY, ETF, MUTUALFUND ...
+    name: str = ""
+
+    @property
+    def found(self) -> bool:
+        """Something usable came back (a sector, an industry or at least the kind of instrument)."""
+        return bool(self.sector or self.industry or self.quote_type)
+
+
 class PriceProvider(Protocol):
     def history(self, symbol: str, start: date, end: date, include_intraday: bool = False) -> SeriesResult: ...
+
+
+class ProfileProvider(Protocol):
+    """Optional second capability of a provider; the sector lookup is skipped for providers without it."""
+    def profile(self, symbol: str) -> ProfileResult: ...
 
 
 # --------------------------------------------------------------------------------------
@@ -94,6 +114,33 @@ def parse_chart_json(symbol: str, payload: dict[str, Any], now_utc: Optional[dat
                         name=meta.get("longName") or meta.get("shortName"))
 
 
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def parse_profile_info(symbol: str, info: Optional[dict[str, Any]]) -> ProfileResult:
+    """``yfinance.Ticker.info`` -> :class:`ProfileResult`.  Yahoo reports ``sector`` and ``industry`` for stocks only; a
+    fund has a ``category`` ("Large Blend") instead, which is not a sector and is not used."""
+    info = info if isinstance(info, dict) else {}
+    return ProfileResult(symbol=symbol, sector=_text(info.get("sector")), industry=_text(info.get("industry")),
+                         quote_type=_text(info.get("quoteType")).upper(),
+                         name=_text(info.get("longName")) or _text(info.get("shortName")))
+
+
+def parse_search_json(symbol: str, payload: Optional[dict[str, Any]]) -> ProfileResult:
+    """The JSON of ``/v1/finance/search`` -> the profile of the quote whose symbol is exactly ``symbol``."""
+    quotes = (payload or {}).get("quotes") if isinstance(payload, dict) else None
+    wanted = symbol.strip().upper()
+    hit = next((q for q in (quotes or []) if isinstance(q, dict) and _text(q.get("symbol")).upper() == wanted), None)
+    if hit is None:
+        raise ProviderError(f"{symbol}: not found")
+    return ProfileResult(
+        symbol=symbol, sector=_text(hit.get("sectorDisp")) or _text(hit.get("sector")),
+        industry=_text(hit.get("industryDisp")) or _text(hit.get("industry")),
+        quote_type=_text(hit.get("quoteType")).upper(),
+        name=_text(hit.get("longname")) or _text(hit.get("shortname")))
+
+
 # --------------------------------------------------------------------------------------
 # Yahoo Finance
 # --------------------------------------------------------------------------------------
@@ -101,6 +148,7 @@ class YahooProvider:
     """Daily closes from Yahoo Finance (unadjusted closes - what a broker shows)."""
 
     CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
     HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                              "Chrome/124.0 Safari/537.36", "Accept": "application/json"}
 
@@ -124,7 +172,53 @@ class YahooProvider:
             errors.append(f"chart API: {exc}")
         raise ProviderError("; ".join(errors))
 
+    def profile(self, symbol: str) -> ProfileResult:
+        """Sector / industry / kind of instrument of ``symbol``.  ``yfinance`` first (it copes with Yahoo's cookie and
+        crumb handling), the public search endpoint as the fallback; every failure is reported as ``ProviderError``."""
+        errors: list[str] = []
+        if self.use_yfinance:
+            try:
+                res = self._profile_via_yfinance(symbol)
+                if res.found:
+                    return res
+                errors.append("yfinance: no profile data")
+            except Exception as exc:                       # noqa: BLE001 - report every failure mode
+                errors.append(f"yfinance: {exc}")
+        try:
+            res = self._profile_via_search(symbol)
+            if res.found:
+                return res
+            errors.append("search: no profile data")
+        except Exception as exc:                           # noqa: BLE001
+            errors.append(f"search: {exc}")
+        raise ProviderError(f"{symbol}: " + "; ".join(errors))
+
     # implementations -------------------------------------------------------------------------------------
+    def _profile_via_yfinance(self, symbol: str) -> ProfileResult:
+        import logging
+
+        import yfinance as yf                              # imported lazily: optional dependency
+
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        return parse_profile_info(symbol, yf.Ticker(symbol).info)
+
+    def _profile_via_search(self, symbol: str) -> ProfileResult:
+        import requests
+
+        params = {"q": symbol, "quotesCount": 8, "newsCount": 0, "listsCount": 0, "enableFuzzyQuery": "false"}
+        last: Optional[Exception] = None
+        for attempt in range(self.retries + 1):
+            try:
+                resp = requests.get(self.SEARCH_URL, params=params, headers=self.HEADERS, timeout=self.timeout)
+                if resp.status_code == 429:
+                    raise ProviderError("rate limited (HTTP 429)")
+                if resp.status_code >= 400:
+                    raise ProviderError(f"HTTP {resp.status_code}")
+                return parse_search_json(symbol, resp.json())
+            except Exception as exc:                       # noqa: BLE001
+                last = exc
+                time.sleep(self.pause * (attempt + 1))
+        raise ProviderError(str(last))
     def _via_yfinance(self, symbol: str, start: date, end: date, include_intraday: bool) -> SeriesResult:
         import logging
 

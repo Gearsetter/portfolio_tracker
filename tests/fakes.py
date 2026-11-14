@@ -6,7 +6,7 @@ import math
 import zlib
 from datetime import date, timedelta
 
-from ibkr_tracker.market.providers import ProviderError, SeriesResult
+from ibkr_tracker.market.providers import ProfileResult, ProviderError, SeriesResult
 
 BASE_LEVELS = {            # symbol -> (level, quote currency)
     "HUF=X": (330.0, "HUF"), "EUR=X": (0.86, "EUR"), "GBP=X": (0.75, "GBP"),
@@ -14,16 +14,32 @@ BASE_LEVELS = {            # symbol -> (level, quote currency)
 }
 
 
+# symbol -> (sector, industry, quoteType): what the fake "Yahoo" answers to a profile lookup (test data only)
+BASE_PROFILES = {
+    "AMZN": ("Consumer Cyclical", "Internet Retail", "EQUITY"), "MSFT": ("Technology", "Software - Infrastructure", "EQUITY"),
+    "GOOGL": ("Communication Services", "Internet Content & Information", "EQUITY"),
+    "META": ("Communication Services", "Internet Content & Information", "EQUITY"),
+    "BN": ("Financial Services", "Asset Management", "EQUITY"), "NVO": ("Healthcare", "Drug Manufacturers - General", "EQUITY"),
+    "AAPL": ("Technology", "Consumer Electronics", "EQUITY"), "SAP.DE": ("Technology", "Software - Application", "EQUITY"),
+    "TSLA": ("Consumer Cyclical", "Auto Manufacturers", "EQUITY"), "KO": ("Consumer Defensive", "Beverages - Non-Alcoholic", "EQUITY"),
+    "VUAA.L": ("", "", "ETF"),
+}
+
+
 class FakeProvider:
     """Deterministic pseudo-random walk on weekdays; records every call for assertions."""
 
     def __init__(self, fail: tuple[str, ...] = (), levels: dict[str, float] | None = None, last_day: date | None = None,
-                 currencies: dict[str, str] | None = None):
+                 currencies: dict[str, str] | None = None, profiles: dict[str, tuple[str, str, str]] | None = None,
+                 profile_fail: tuple[str, ...] = ()):
         self.calls: list[tuple[str, date, date]] = []
         self.fail = set(fail)
         self.levels = levels or {}
         self.last_day = last_day
         self.currencies = currencies or {}             # symbol -> quote currency (default: USD, like most test symbols)
+        self.profiles = {**BASE_PROFILES, **(profiles or {})}      # symbol -> (sector, industry, quoteType)
+        self.profile_fail = set(profile_fail)
+        self.profile_calls: list[str] = []
 
     def history(self, symbol: str, start: date, end: date, include_intraday: bool = False) -> SeriesResult:
         self.calls.append((symbol, start, end))
@@ -44,3 +60,12 @@ class FakeProvider:
         if not rows:
             raise ProviderError(f"{symbol}: no rows")
         return SeriesResult(symbol=symbol, rows=rows, currency=ccy, name=f"Fake {symbol}")
+
+    def profile(self, symbol: str) -> ProfileResult:
+        self.profile_calls.append(symbol)
+        if symbol in self.profile_fail:
+            raise ProviderError(f"{symbol}: simulated outage")
+        if symbol not in self.profiles:
+            raise ProviderError(f"{symbol}: not found")
+        sector, industry, qtype = self.profiles[symbol]
+        return ProfileResult(symbol, sector, industry, qtype, f"Fake {symbol}")

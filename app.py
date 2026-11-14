@@ -23,9 +23,12 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ibkr_tracker import __version__                                   # noqa: E402
+from ibkr_tracker import allocation as A                               # noqa: E402
+from ibkr_tracker import analytics                                     # noqa: E402
 from ibkr_tracker import tables as T                                   # noqa: E402
 from ibkr_tracker.config import hide_closed_dust                       # noqa: E402
-from ibkr_tracker.exports import CSV_STYLE_LABELS, CSV_STYLES, csv_style, history_csv  # noqa: E402
+from ibkr_tracker.exports import (CSV_STYLE_LABELS, CSV_STYLES, csv_style, history_csv,  # noqa: E402
+                                   risk_csv)
 from ibkr_tracker.market.manual import BENCHMARK_KEY, PriceParseError, prices_to_text  # noqa: E402
 from ibkr_tracker.market.symbols import yahoo_symbol                   # noqa: E402
 from ibkr_tracker.portfolio import CONSOLIDATED, CONSOLIDATED_LABEL    # noqa: E402
@@ -256,7 +259,7 @@ def secondary_benchmark_card(b, bench_label: str) -> None:
              "Purchase-weighted average time from each stock transaction to the valuation date.")
 
 
-def dashboard(snap: Snapshot) -> None:
+def dashboard(snap: Snapshot, tracker: Tracker) -> None:
     m, md, p, s = snap.metrics, snap.md, snap.portfolio, snap.settings
     base = m.base_currency
     bench_label = (s.get("benchmark_symbol") or "benchmark").split(".")[0]
@@ -352,6 +355,7 @@ def dashboard(snap: Snapshot) -> None:
             st.bar_chart(pd.DataFrame(alloc), x="Holding", y="USD", horizontal=True, **stretch())
 
     performance_history(snap)
+    portfolio_analysis(tracker, snap)
 
     source = {"open_positions": "the Open Positions section of the latest statement",
               "open_positions+transactions": "the newest Open Positions section plus the later transactions",
@@ -450,6 +454,284 @@ def performance_history(snap: Snapshot) -> None:
         st.download_button("⬇  Download the daily history (CSV)", data=data,
                            file_name=f"IBKR_Portfolio_{snap.portfolio.account}_history.csv", mime="text/csv",
                            key="download_history_csv")
+
+
+# ======================================================================================================
+# portfolio analysis: allocation (donut chart) and risk & return
+# ======================================================================================================
+def theme_text_color() -> str:
+    """Text colour for the centre of the donut: the active theme's (``st.context.theme`` - Streamlit 1.46+), else a mid
+    grey that can be read on a light and on a dark background."""
+    try:
+        kind = st.context.theme.type
+    except Exception:                                                  # noqa: BLE001 - older Streamlit / no browser yet
+        kind = None
+    return {"light": "#1F2933", "dark": "#F5F7FA"}.get(kind or "", "#8B93A0")
+
+
+PALETTE = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B", "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC"]
+GROUP_LABELS = A.GROUPINGS
+
+
+def donut_chart(slices: list[A.Slice], total: float, height: int = 340):
+    """A donut chart of ``slices`` (Altair): the legend carries the weights, the hole the total, the tooltip the details."""
+    import altair as alt
+
+    legend = [f"{s.label}  ·  {s.weight * 100:.1f}%" for s in slices]
+    df = pd.DataFrame({"Group": [s.label for s in slices], "Legend": legend, "USD": [s.usd_value for s in slices],
+                       "Weight": [s.weight for s in slices]})
+    outer = int(height * 0.46)
+    arcs = alt.Chart(df).mark_arc(innerRadius=int(outer * 0.58), outerRadius=outer, padAngle=0.012,
+                                  cornerRadius=2).encode(
+        theta=alt.Theta("USD:Q", stack=True),
+        color=alt.Color("Legend:N", sort=legend, scale=alt.Scale(domain=legend, range=PALETTE[:len(legend)]),
+                        legend=alt.Legend(title=None, orient="right", symbolType="circle", symbolSize=170,
+                                          labelFontSize=13, labelLimit=330, rowPadding=5)),
+        order=alt.Order("USD:Q", sort="descending"),
+        tooltip=[alt.Tooltip("Group:N"), alt.Tooltip("USD:Q", format=",.2f", title="USD value"),
+                 alt.Tooltip("Weight:Q", format=".1%")])
+    ink = theme_text_color()
+    hole = alt.Chart(pd.DataFrame({"x": [0]})).mark_text(fontSize=22, fontWeight="bold", dy=-9, color=ink).encode(
+        text=alt.value(f"{total:,.0f}"))
+    unit = alt.Chart(pd.DataFrame({"x": [0]})).mark_text(fontSize=13, dy=13, color=ink).encode(
+        text=alt.value("USD in total"))
+    return (arcs + hole + unit).properties(height=height).configure_view(stroke=None)
+
+
+def allocation_view(tracker: Tracker, snap: Snapshot) -> None:
+    holdings = snap.holdings()
+    if not holdings:
+        st.info("There is nothing to allocate - the portfolio holds no stocks and no cash.")
+        return
+    st.caption("How the portfolio is split - shares of the positive USD values of the stocks and cash balances. Pick the "
+               "grouping: asset class, stock type, industry sector, currency or single holding.")
+    by = st.radio("Group by", list(GROUP_LABELS), format_func=GROUP_LABELS.get, horizontal=True, key="alloc_by")
+    a = snap.allocation(by)
+    if not a.slices:
+        st.info("There are no positive values to chart.")
+    else:
+        left, right = st.columns([3, 2])
+        with left:
+            st.altair_chart(donut_chart(A.chart_slices(a), a.total), **stretch())
+        with right:
+            tab = T.allocation_table(a)
+            tab["Weight"] = tab["Weight"] * 100
+            show_df(tab.drop(columns=["Members"]), column_config={
+                "USD Value": st.column_config.NumberColumn(format="%.2f"),
+                "Weight": st.column_config.NumberColumn(format="%.1f%%"),
+                "Holdings": st.column_config.NumberColumn(format="%d", width="small")}, height=min(35 * (len(tab) + 1) + 3, 420))
+            st.caption(f"Total {a.total:,.2f} USD = 100 %.")
+        if len(a.slices) > len(A.chart_slices(a)):
+            st.caption("The smallest groups are merged into *Other* in the chart; the table lists every one.")
+    if a.excluded:
+        st.caption("Not in the chart (a negative value cannot be a slice): " +
+                   ", ".join(f"{t} {v:,.2f} USD" for t, v in a.excluded) + ".")
+    if by == "sector" and a.unclassified_share > 0:
+        st.info(f"{a.unclassified_share * 100:.1f}% of the portfolio has no sector yet. IBKR statements carry no sector "
+                "information: press *Look up sectors* below (Yahoo Finance) or type the sector in yourself.")
+
+    c = A.concentration(holdings)
+    cols = st.columns(5)
+    tips = {"Stock positions": "Stocks held now.", "Effective positions":
+            "1 / Σ weight² of the stock weights: how many equally large positions would be as concentrated as this "
+            "portfolio (10 equal positions = 10.0; one dominant position = close to 1).",
+            "Top 3 positions": "Share of the three largest stocks in the whole portfolio (stocks + cash)."}
+    for col, (label, value, kind) in zip(cols, T.concentration_cards(c)):
+        text = ("n/a" if value is None else f"{value * 100:.1f}%" if kind == "pct" else
+                f"{value:,.0f}" if kind == "count" else f"{value:,.2f}")
+        kpi(col, label, text, help=tips.get(label, "Share of the whole portfolio (stocks + cash)." if kind == "pct" else None))
+    classification_editor(tracker, snap)
+
+
+def classification_editor(tracker: Tracker, snap: Snapshot) -> None:
+    p, s = snap.portfolio, snap.settings
+    holdings = snap.holdings()
+    stocks = [h for h in holdings if not h.is_cash]
+    if not stocks:
+        return
+    online = s.get("price_source", "yahoo") == "yahoo"
+    with st.expander("Classify your holdings - asset class and industry sector", expanded=False):
+        st.caption("The asset class comes from the instrument type in your statement (an ETF or fund is *ETFs & funds*, "
+                   "everything else *Stocks*); the sector from Yahoo Finance (*Look up sectors*) - funds have none. "
+                   "Type another value into **Asset class** or **Sector** to override it; an entry that equals the "
+                   "automatic value is not kept. Sector names follow Yahoo's: " + ", ".join(A.SECTORS) + ".")
+        nonce = st.session_state.setdefault("class_nonce", 0)
+        df = T.classification_table(holdings)
+        df["Weight"] = df["Weight"] * 100
+        options = list(dict.fromkeys([*A.ASSET_CLASSES, *df["Asset class"]]))
+        edited = st.data_editor(
+            df, hide_index=True, key=f"class_editor_{nonce}",
+            disabled=[c for c in df.columns if c not in ("Asset class", "Sector")],
+            column_config={
+                "Asset class": st.column_config.SelectboxColumn(options=options, required=True),
+                "Sector": st.column_config.TextColumn(help="Empty = the automatic sector (Yahoo Finance, or 'ETFs & "
+                                                           "funds' / 'Unclassified')."),
+                "USD Value": st.column_config.NumberColumn(format="%.2f"),
+                "Weight": st.column_config.NumberColumn(format="%.1f%%"),
+                "Ticker": st.column_config.TextColumn(width="small"), "Currency": st.column_config.TextColumn(width="small"),
+                "Statement type": st.column_config.TextColumn(width="small")}, **stretch())
+        b1, b2, b3 = st.columns([1, 1.4, 1.6])
+        force = b3.checkbox("Ask Yahoo again for stocks that already have a sector", value=False, key="class_force",
+                            disabled=not online)
+        if b1.button("💾  Save classification", key="class_save", type="primary"):
+            edits = {f"{r['Ticker']}|{r['Currency']}": ("" if pd.isna(r["Asset class"]) else str(r["Asset class"]),
+                                                        "" if pd.isna(r["Sector"]) else str(r["Sector"]))
+                     for _, r in edited.iterrows()}
+            change = tracker.save_classification(holdings, edits)
+            for e in change.errors:
+                flash("error", e)
+            if change.changed:
+                flash("success", f"Classification saved ({len(change.changed)} holding(s) changed).")
+                if s.get("export_excel"):
+                    post_outcome(tracker.export(p.account), "Classification")
+            elif not change.errors:
+                flash("info", "The classification is unchanged.")
+            st.session_state["class_nonce"] = nonce + 1
+            st.rerun()
+        if b2.button("🔎  Look up sectors (Yahoo Finance)", key="class_lookup", disabled=not online,
+                     help="Asks Yahoo Finance for the sector of every stock you hold and remembers the answers. "
+                          "Press *Refresh Prices* never does this by itself."):
+            bar, cb = progress_bar("Looking up ...")
+            out = tracker.lookup_profiles(p.account, progress=cb, force=bool(force))
+            bar.empty()
+            report = out.report
+            if report is not None:
+                flash("success" if (report.ok and not report.no_sector) else "warning", report.summary())
+                for m in report.messages:
+                    flash("warning", m)
+                for key, err in report.errors.items():
+                    flash("warning", f"{key.split('|')[0]}: {short_error(err)}")
+                if report.found and s.get("export_excel"):
+                    post_outcome(tracker.export(p.account), "Sector lookup")
+            for e in out.errors:
+                if report is None:
+                    flash("error", e)
+            st.session_state["class_nonce"] = nonce + 1
+            st.rerun()
+        if not online:
+            st.caption("Offline mode (statements only) is on - sectors cannot be looked up; type them in instead.")
+
+
+def risk_view(tracker: Tracker, snap: Snapshot) -> None:
+    h = snap.history()
+    if h is None or h.empty:
+        st.info("There is nothing to analyse yet - the statements contain no transactions.")
+        return
+    base = h.base_currency
+    c1, c2, c3 = st.columns([1.1, 2.2, 1.1])
+    with c1:
+        unit_choice = st.radio("Currency", [base, "USD"] if base != "USD" else ["USD"], horizontal=True, key="risk_unit",
+                               help="The base-currency view includes the currency effect (a falling dollar is a loss "
+                                    "for a euro or forint investor); the USD view is the portfolio's own movement.")
+    with c2:
+        period = st.radio("Period", HISTORY_PERIODS, horizontal=True, key="risk_period",
+                          help="The window the figures are computed over (the volatility of the last 3 months is not "
+                               "the volatility of the whole lifespan).")
+    unit = "base" if (unit_choice == base and base != "USD") else "usd"
+    ccy = base if unit == "base" else "USD"
+    saved = analytics.risk_free_rate(snap.settings, ccy) * 100.0
+    with c3:
+        rf = st.number_input(f"Risk-free rate ({ccy}, % p.a.)", min_value=-50.0, max_value=100.0, value=float(saved),
+                             step=0.25, format="%.2f", key=f"risk_rf_{ccy}",
+                             help="The return you could have had without risk (a government bill or a savings account). "
+                                  "Used by Sharpe, Sortino, alpha and Treynor; remembered per currency and written to the "
+                                  "workbook's Risk sheet at its next update. 0 = the plain ratio of return to risk.")
+    if abs(rf - saved) > 1e-9:
+        tracker.set_risk_free(ccy, rf)
+    rep = snap.risk(unit, period_start(h.end, period), rf / 100.0)
+    st.caption(f"Time-weighted daily returns of the day-by-day history ({ccy}): deposits and withdrawals are taken out, so "
+               "the figures measure the investing, not the timing of the payments. Annualised with 252 trading days.")
+    if rep.status in (analytics.NO_HISTORY, analytics.NO_PRICES):
+        st.info(rep.message)
+        return
+    if rep.status == analytics.FEW_DAYS:
+        st.info(rep.message)
+    for note in rep.notes:
+        st.warning(note)
+    p, b = rep.portfolio, rep.benchmark
+    bench = (rep.benchmark_symbol or "benchmark").split(".")[0]
+    if rep.status == analytics.OK:
+        r1 = st.columns(4)
+        kpi(r1[0], "Annualised volatility", fmt_pct(p.volatility, signed=False),
+            help="Standard deviation of the daily returns x √252 - the typical yearly swing." +
+                 (f" {bench}: {fmt_pct(b.volatility, signed=False)}." if b and b.volatility is not None else ""))
+        kpi(r1[1], "Maximum drawdown", fmt_pct(p.max_drawdown, signed=False),
+            help="The largest fall from a previous high. " + (analytics.drawdown_period(p) or "") +
+                 (f" {bench}: {fmt_pct(b.max_drawdown, signed=False)}." if b and b.max_drawdown is not None else ""))
+        kpi(r1[2], "Sharpe ratio", "n/a" if p.sharpe is None else f"{p.sharpe:.2f}",
+            help="(Mean daily return - risk-free) / volatility, annualised. Above 1 is good, above 2 very good." +
+                 (f" {bench}: {b.sharpe:.2f}." if b and b.sharpe is not None else ""))
+        kpi(r1[3], "Sortino ratio", "n/a" if p.sortino is None else f"{p.sortino:.2f}",
+            help="Like Sharpe, but only the days below the risk-free rate count as risk.")
+        r2 = st.columns(4)
+        kpi(r2[0], "Time-weighted return", fmt_pct(p.cumulative),
+            None if p.annualized is None else f"{fmt_pct(p.annualized, signed=False)} a year",
+            help="What the money at work earned, deposits and withdrawals removed.")
+        kpi(r2[1], "Calmar ratio", "n/a" if p.calmar is None else f"{p.calmar:.2f}",
+            help="Annualised return / |maximum drawdown| - return per unit of the worst fall.")
+        rel = rep.relative
+        kpi(r2[2], f"Beta vs {bench}", "n/a" if rel is None or rel.beta is None else f"{rel.beta:.2f}",
+            help="1.2 = the portfolio moved 20 % more than the benchmark on a typical day." if rel else
+                 "Needs benchmark prices (Refresh Prices).")
+        kpi(r2[3], "Daily Value at Risk (95%)", fmt_pct(p.var95, signed=False),
+            help="On 95 % of the days the loss was smaller than this (historical simulation, 1 day).")
+    else:
+        r1 = st.columns(2)
+        kpi(r1[0], "Time-weighted return", fmt_pct(p.cumulative))
+        kpi(r1[1], "Maximum drawdown", fmt_pct(p.max_drawdown, signed=False))
+
+    table = T.risk_table(rep)
+    if len(table):
+        numbers = table[table["Metric"] != analytics.DRAWDOWN_PERIOD_LABEL]
+        for group in dict.fromkeys(numbers["Group"]):
+            part = numbers[numbers["Group"] == group].drop(columns=["Group"])
+            st.markdown(f"**{group}**")
+            show_df(part, column_config={"Metric": st.column_config.TextColumn(width="medium"),
+                                         "Portfolio": st.column_config.TextColumn(width="small"),
+                                         part.columns[2]: st.column_config.TextColumn(width="small"),
+                                         "What it means": st.column_config.TextColumn(width="large")},
+                    height=35 * (len(part) + 1) + 3)
+        if p.mdd_peak is not None:
+            st.caption(f"Maximum drawdown of the portfolio: {analytics.drawdown_period(p)}." +
+                       (f" {bench}: {analytics.drawdown_period(b)}." if b is not None and b.mdd_peak is not None else ""))
+    if rep.status == analytics.OK and not rep.frame.empty:
+        tabs = st.tabs(["Drawdown", f"Rolling volatility ({analytics.ROLLING_WINDOW} days)", "Return distribution"])
+        with tabs[0]:
+            st.line_chart(T.risk_chart_frame(rep, "drawdown"), height=300, **stretch())
+            st.caption("Distance (%) from the highest point of the time-weighted index so far - 0 = at a new high.")
+        with tabs[1]:
+            vol = T.risk_chart_frame(rep, "rolling_vol")
+            if vol.dropna(how="all").empty:
+                st.info(f"The rolling volatility needs {analytics.ROLLING_WINDOW} trading days.")
+            else:
+                st.line_chart(vol, height=300, **stretch())
+                st.caption(f"Annualised volatility (%) of the last {analytics.ROLLING_WINDOW} trading days.")
+        with tabs[2]:
+            import altair as alt
+
+            returns = pd.DataFrame({"Daily return (%)": rep.frame["ret"].to_numpy() * 100.0})
+            hist = alt.Chart(returns).mark_bar().encode(
+                x=alt.X("Daily return (%):Q", bin=alt.Bin(maxbins=40)), y=alt.Y("count()", title="Days"),
+                tooltip=[alt.Tooltip("count()", title="Days")])
+            var_line = alt.Chart(pd.DataFrame({"x": [-(p.var95 or 0.0) * 100.0]})).mark_rule(
+                color="#E45756", strokeDash=[5, 4], size=2).encode(x="x:Q")
+            st.altair_chart((hist + var_line).properties(height=300), **stretch())
+            st.caption("How often each daily return occurred; the dashed line is the 95 % Value at Risk.")
+    data = risk_csv(snap, unit, period_start(h.end, period), rf / 100.0)
+    if data:
+        st.download_button("⬇  Download these risk metrics (CSV)", data=data,
+                           file_name=f"IBKR_Portfolio_{snap.portfolio.account}_risk_{ccy}.csv", mime="text/csv",
+                           key="download_risk_csv")
+
+
+def portfolio_analysis(tracker: Tracker, snap: Snapshot) -> None:
+    """Allocation (donut chart) and risk & return - the part of the dashboard below the performance charts."""
+    st.markdown("#### Portfolio analysis")
+    tab_alloc, tab_risk = st.tabs(["Allocation breakdown", "Risk & return"])
+    with tab_alloc:
+        allocation_view(tracker, snap)
+    with tab_risk:
+        risk_view(tracker, snap)
 
 
 # ======================================================================================================
@@ -1021,7 +1303,7 @@ def main() -> None:
     tabs = st.tabs(["Dashboard", "Transactions", "Reconciliation", "Market data", "Archive", "Excel export"])
     with tabs[0]:
         if snap.metrics is not None:
-            dashboard(snap)
+            dashboard(snap, tracker)
         else:
             st.info("The dashboard needs FX rates - see the Market data tab.")
     with tabs[1]:

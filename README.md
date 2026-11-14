@@ -16,6 +16,12 @@ periods, any number of accounts) and get
 * the **performance of the whole lifespan, day by day** – value, deposits, gain, return, CAGR, allocation and the
   VUAA comparison from the first transaction to today, rebuilt from the transactions and the daily prices instead
   of from the moments you pressed *Refresh* (§15);
+* a **portfolio analysis** below the performance charts: a **donut chart** of the allocation by asset class, stock type,
+  industry sector, currency or single holding, the concentration of the portfolio and your own classification of every
+  holding (§16), and the **risk and risk‑adjusted return metrics** that were missing – annualised volatility, maximum
+  drawdown, Sharpe, Sortino and Calmar ratios, Value at Risk, beta and alpha against the benchmark – with drawdown,
+  rolling‑volatility and return‑distribution charts (§17); both are also in the workbook (sheets `Allocation`, `Risk`,
+  `RiskData`) and in the CSV files;
 * a **ticker mapping** (IBKR ticker → Yahoo Finance symbol, saved permanently, §13) and a **manual price history**
   (paste, upload or type `Date, Price`) for a stock Yahoo does not know, which flows into every valuation next to the
   downloaded prices (§14);
@@ -23,7 +29,7 @@ periods, any number of accounts) and get
   history survives restarts and old statements can be combined with new ones.
 
 Everything runs on your own computer. The only network access is the (optional) download of daily closing prices
-from Yahoo Finance.
+from Yahoo Finance – and, when you press the button, the lookup of the sector of your stocks (§16).
 
 ---------------------------------------------------------------------------------------------------------------
 
@@ -64,10 +70,11 @@ A ready‑made example built from the two statements you supplied is in
 **The dashboard** shows, from top to bottom: total value, net deposits, return and CAGR in USD; the same in your
 base currency; stocks, cash, "what the same purchases would be worth in VUAA" and the **VUAA CAGR (USD)**; a small
 *Benchmark comparison · details* card (**Stocks minus VUAA (USD)**, stocks CAGR on the same basis, VUAA return,
-average years since the purchases); in the consolidated view an **Accounts** table; then **Performance since the
-first transaction** (the day‑by‑day charts of §15); then positions, cash balances and allocation (with the view
-filter on, closed positions and dust balances are not listed there – a one‑line note says what was left out). Problems
-with a ticker or a missing price are solved in the *Market data* tab (§13, §14).
+average years since the purchases); in the consolidated view an **Accounts** table; then positions, cash balances and
+the allocation bar chart (with the view filter on, closed positions and dust balances are not listed there – a one‑line
+note says what was left out); then **Performance since the first transaction** (the day‑by‑day charts of §15) and, at
+the bottom, **Portfolio analysis** with the two tabs *Allocation breakdown* (donut chart, §16) and *Risk & return*
+(§17). Problems with a ticker or a missing price are solved in the *Market data* tab (§13, §14).
 
 ## 2. What the workbook contains
 
@@ -90,9 +97,13 @@ formulas black, cross‑sheet look‑ups green, yellow = cells you may overwrite
 Other sheets: **Prices** (latest prices with the Yahoo symbol and the source of each price – including your
 aliases and manual prices –, FX, the settings that all formulas read, yellow *Override* columns),
 **FX** and **Benchmark** (daily history used for purchase‑date conversions), **History** (one row per day of the whole
-lifespan with two charts – §15; values, not formulas), **Checks** (reconciliation with the statement: cash per
-currency, share counts, NAV), **About** (index with links, conventions, warnings, data‑coverage notes, statements
-included) and a hidden `_state` sheet (layout version, archive signature, snapshot of your overrides).
+lifespan with two charts – §15; values, not formulas), **Allocation** (donut charts by asset class, stock type, industry
+sector and currency, the concentration figures and the classification of every holding – §16; the USD values are
+formulas that read Sections 6 and 7), **Risk** and **RiskData** (volatility, drawdown, Sharpe / Sortino / Calmar, Value at
+Risk and the figures against the benchmark as formulas over the daily observations, with two charts – §17), **Checks**
+(reconciliation with the statement: cash per currency, share counts, NAV), **About** (index with links, conventions,
+warnings, data‑coverage notes, statements included) and a hidden `_state` sheet (layout version, archive signature,
+snapshot of your overrides).
 
 In the **consolidated workbook** (`IBKR_Portfolio_ALL.xlsx`, see §6) the records of Sections 1–4 carry a ninth
 column, **Account** (`I`), saying which account each line comes from; everything else is laid out identically.
@@ -111,9 +122,9 @@ Only classic functions are used (`SUMIFS`, `INDEX/MATCH`, `IFERROR`, `SUMPRODUCT
    symbol never stops the others, and after three consecutive failures without a single success the app gives up
    quickly (offline) and keeps working with the cached / statement / manual data. Stocks set to *manual prices only*
    (§13) are never requested.
-3. The existing workbook is updated **in place**: only `Prices`, `FX`, `Benchmark`, `History`, `About` (and the hidden
-   state) are rewritten – every formula, format and comment of `Portfolio` and `Checks` stays exactly as it is and
-   recalculates. If the statement archive changed (new transactions, other layout version) or you switched the view
+3. The existing workbook is updated **in place**: only `Prices`, `FX`, `Benchmark`, `History`, `Allocation`, `Risk`,
+   `RiskData`, `About` (and the hidden state) are rewritten – every formula, format and comment of `Portfolio` and
+   `Checks` stays exactly as it is and recalculates. If the statement archive changed (new transactions, other layout version) or you switched the view
    filter (§12) the workbook is regenerated and the previous file is kept as `…previous.xlsx`. The file is written atomically; if Excel has it open you get a
    clear message and nothing is changed. The consolidated workbook is refreshed the same way.
 4. A small value snapshot is still stored at every refresh, separately for every account and for the consolidated
@@ -125,8 +136,9 @@ Only classic functions are used (`SUMIFS`, `INDEX/MATCH`, `IFERROR`, `SUMPRODUCT
 snapshot in `_state`; an edit in the file wins, clearing a cell removes the override).
 
 **Settings** (export toggle, view filter, price source, benchmark symbol, days per year, base currency of the
-consolidated view, CSV format, output folder, overrides, ticker mapping, last account) and your **manual prices** are
-stored in `data/tracker.db` and restored at the next start.
+consolidated view, CSV format, output folder, overrides, ticker mapping, your asset class / sector classification, the
+risk‑free rates, last account) and your **manual prices** are stored in `data/tracker.db` and restored at the next
+start. The sectors looked up at Yahoo Finance are cached there as well.
 
 ## 4. Conventions and interpretation choices
 
@@ -214,7 +226,8 @@ The sidebar selector **Account / view** keeps listing every account on its own (
   * **CSV**: *Download all tables (.zip of CSV files)*, single files, or *Save the CSV files to the output folder*
     (`IBKR_Portfolio_ALL_csv/`): `summary.csv`, `positions.csv`, `cash.csv`, `stock_transactions.csv`,
     `dividends.csv`, `deposits_withdrawals.csv`, `forex.csv`, `accounts.csv` (per‑account breakdown) and
-    `checks.csv`. UTF‑8 with byte order mark. **CSV format**: *International* (comma separated, decimal point – pandas,
+    `checks.csv`, plus – when there is something to analyse – `allocation.csv`, `holdings.csv`, `risk_metrics.csv` and
+    `risk_daily.csv` (§16, §17; the consolidated portfolio is analysed as one). UTF‑8 with byte order mark. **CSV format**: *International* (comma separated, decimal point – pandas,
     R, Google Sheets) or *European Excel* (semicolon separated, decimal comma – what a double click in Excel needs
     under a Hungarian, German, French … regional setting). The single‑account views export the same files.
 
@@ -229,14 +242,18 @@ ibkr_tracker/
                            consolidate() = all accounts as one portfolio
   calc.py                  Python implementation of every number the workbook computes (oracle + dashboard)
   history.py               day-by-day reconstruction of the whole lifespan (value, deposits, return, CAGR, benchmark)
+  allocation.py            classification of the holdings (asset class, stock type, sector) and the weights per grouping
+  analytics.py             time-weighted daily returns -> volatility, drawdown, Sharpe / Sortino / Calmar, VaR, beta, alpha
   reconcile.py             cash / share counts / NAV versus the statement(s)
-  market/                  Yahoo provider, SQLite cache, statement-derived fallback, symbol rules, merged price series,
-                           mapping.py (ticker aliases), manual.py (the Date, Price reader), service.py (refresh / build)
-  excel/                   builder (workbook), refresh (in-place update / rebuild), overrides, recalc (cached values)
+  market/                  Yahoo provider (prices, sector profiles), SQLite cache, statement-derived fallback, symbol rules,
+                           merged price series, mapping.py (ticker aliases), manual.py (the Date, Price reader),
+                           service.py (refresh / build / sector lookup)
+  excel/                   builder (workbook), refresh (in-place update / rebuild), overrides, recalc (cached values),
+                           analysis_sheets.py (Allocation, Risk, RiskData sheets with their donut / line charts)
   exports.py, tables.py    CSV export (international / European dialect) and the tables behind it and the GUI
   storage.py, tracker.py   archive + settings (SQLite) and the service layer used by the GUI
 scripts/make_sample_workbook.py   regenerates examples/output/*.xlsx offline from examples/statements
-tests/                     486 tests (pytest)
+tests/                     590 tests (pytest)
 .devcontainer/             VS Code dev container: Dockerfile, devcontainer.json, post-create.sh (see §11)
 .vscode/                   F5 debug configuration, tasks (run the app, tests), recommended extensions
 ```
@@ -279,6 +296,12 @@ there – in *Protected View* click **Enable Editing** once and Excel fills in t
   prices you enter by hand are split‑adjusted as well. Days without a price are valued at the stock's last purchase /
   sale price and flagged; a stock a provider has never heard of needs a symbol (§13) or manual prices (§14) for a
   meaningful curve. Intraday timing, accrued interest and a position that was transferred out are not modelled.
+* The **risk metrics** (§17) are computed from that history, so they need **daily prices**: the example workbook was
+  built offline (statement closes only), its *Risk* sheet therefore says that prices are missing – after the first
+  *Refresh Prices* on your computer it fills in. Short windows give unstable figures (fewer than 20 observation days: no
+  ratios; fewer than 60: indicative), and a historical Value at Risk is not a forecast. The sector names come from Yahoo
+  Finance (looked up on request, untested against the live service like the price download); IBKR itself provides none,
+  so until you look them up or type them in, a stock is *Unclassified* in the sector view.
 
 ## 10. Tests
 
@@ -308,6 +331,17 @@ a workbook of version 1.2 gaining the sheet, `history.csv`, a LibreOffice cross�
 persistence, priority and merging in the valuation, the benchmark, the workbook) and `test_mapping.py` (symbol rules,
 edits, the mapping file, symbol test, persistence, targeted download, wrong‑currency protection, the workbook); the
 screens are exercised with Streamlit's `AppTest`.
+
+The 1.4.0 features (§16, §17) have five more: `test_analytics.py` checks every risk figure against an independent
+hand / numpy calculation on a hand‑built day‑by‑day history (observation days, flow‑adjusted returns, volatility,
+downside deviation, maximum drawdown with its dates, Sharpe / Sortino / Calmar, VaR / expected shortfall, beta, alpha,
+tracking error, the windows and the cases in which the figures are withheld); `test_allocation.py` (the classification
+rules and their priority, the weights per grouping, negative balances, the *Other* merge, the concentration, the sector
+names, the Yahoo profile lookup and its cache, failures included); `test_analysis_tracker.py` (the same through the
+Tracker: the saved classification and risk‑free rates, the CSV files, the consolidated view); `test_gui_analysis.py`
+(the section on the dashboard with `AppTest`) and `test_excel_analysis.py` (the *Allocation*, *Risk* and *RiskData*
+sheets recalculated by LibreOffice and compared with the Python engine cell by cell, both currencies, with and without
+risk‑free rates, a USD‑only and a consolidated account, a workbook without prices, in‑place refresh of a 1.3 workbook).
 
 ## 11. Development container (VS Code)
 
@@ -484,7 +518,137 @@ daily price series**, so it is complete from the first refresh on – and from t
 * It does not depend on the view filter of §12 and is computed from the archive, the price cache and your manual
   prices only – no network access.
 
+## 16. Allocation and donut charts
+
+The dashboard section **Portfolio analysis** (below *Performance since the first transaction*) has the tab
+**Allocation breakdown**: a **donut chart** of how the portfolio is split, with the same numbers in a table next to it.
+
+* **Five groupings** (the *Group by* switch): **Asset class** (Stocks · ETFs & funds · Cash – or your own classes),
+  **Stock type** (the instrument type of the statement: Common stock, ADR, ETF, REIT, Preferred stock …), **Industry
+  sector**, **Currency** (the currency a stock is quoted in, and every cash balance) and **Holding** (every stock and
+  every cash balance on its own).
+* **What a slice is.** The share of the **positive USD values** of the stocks held now and the cash balances – the same
+  prices, FX rates and view filter (§12) as the rest of the dashboard. The legend carries the weights, the hole the
+  total, the tooltip the USD value. A **negative** balance (a margin loan) cannot be a slice: it is listed under the
+  chart and left out of the 100 %. More than ten groups: the smallest are merged into *Other (n)* in the chart (the
+  table lists every group with its number of holdings; `allocation.csv` names the holdings, largest first). The colours
+  work in the light and the dark theme.
+* **Concentration** (cards below the chart): number of stock positions, the largest position, the top 3 and top 5
+  (shares of the whole portfolio, stocks + cash) and the **effective number of positions** `1 / Σ w²` of the stock
+  weights (10 equally large positions = 10.0; one dominant position → close to 1).
+* **Where the classes come from – and what they cannot know.** IBKR statements say whether an instrument is an ETF, an
+  ADR, a REIT … but **nothing about its industry**. Therefore (highest priority first):
+  1. **your own entry** (below);
+  2. **asset class**: the statement's *Type* – an ETF / ETN / fund is *ETFs & funds*, every other instrument
+     *Stocks*, a cash balance *Cash*; **sector**: the sector **Yahoo Finance** reports for the stock (Technology,
+     Healthcare, Financial Services, Consumer Cyclical, Consumer Defensive, Industrials, Energy, Utilities, Real Estate,
+     Basic Materials, Communication Services), *ETFs & funds* for a fund without a sector, *Unclassified* for a stock
+     nobody classified yet – the *Industry sector* view says how large that share is.
+* **Sector lookup is a button, not part of *Refresh Prices*.** *Classify your holdings → **Look up sectors (Yahoo
+  Finance)*** asks Yahoo for the sector of every stock you hold and remembers the answer in the archive
+  (`instrument_profiles`). Funds (they have no sector), stocks set to *manual prices only* (§13) and stocks to which you
+  gave a sector yourself are not asked; a stock whose sector is already known is not asked again unless you tick *Ask
+  Yahoo again for stocks that already have a sector*. The Yahoo symbol is the one of the ticker mapping (§13); a failing
+  symbol is reported by name and never stops the others (three failures in a row without any answer end the lookup – the
+  connection is probably down). It needs the *Yahoo Finance* price source (not the offline *statements only* mode) and
+  internet access.
+* **Your own classification.** In the same expander, the table lists every stock with its *Asset class* (a drop‑down of
+  Stocks · ETFs & funds · Bonds · Commodities · Real estate · Crypto · Other – or type your own) and *Sector* (a text
+  cell; the usual GICS names such as "Information Technology" or "Health Care" are matched to Yahoo's). **Save
+  classification** stores the entries permanently in the settings (key `TICKER|CCY`); an entry equal to the automatic
+  value is not kept, and clearing a cell returns to the automatic value. The workbook is updated right away when the
+  Excel export is on.
+* **Excel** – sheet **Allocation**: one block per grouping (asset class, stock type, sector, currency) with a table and a
+  **native Excel donut chart**, the concentration figures and the **Holdings and their classification** table. The USD
+  values are **formulas** that read the *USD Value* cells of Sections 6 and 7, the weights, group totals (`SUMIFS`) and
+  the concentration are formulas too – so the charts follow every price refresh and the workbook's own total (a check
+  line says when a block does not add up). Only the *labels* (asset class, stock type, sector) are values written by
+  the app; change them in the app. **CSV** – `allocation.csv` (every grouping stacked: group, USD value, weight,
+  holdings, members) and `holdings.csv` (the classification of every holding).
+
+## 17. Risk and risk‑adjusted return metrics
+
+The tab **Risk & return** of *Portfolio analysis* answers *"how bumpy was the road?"* – the CAGR of §4 says what the
+deposits earned, but says nothing about the swings, and it depends on **when** money was paid in. The metrics below
+therefore use the **time‑weighted daily returns** of the day‑by‑day history of §15, in which deposits and withdrawals
+are taken out on the day they happen.
+
+* **Observation days.** Monday–Friday days of the history plus the valuation date; a day on which nothing moved (a
+  market holiday, a carried‑forward price, a day with only a deposit) is not an observation – its flow is added to the
+  next one. The return of day *t* is `r_t = V_t / (V_prev + F_t) − 1` (`V` = total value of stocks + cash, `F` = net
+  deposits since the previous observation, assumed to be at work all day). The wealth index is `Π(1 + r)`; the
+  time‑weighted return is its last value minus 1. Everything is **annualised with 252 trading days**.
+* **Controls.** *Currency* – the base currency (includes the currency effect: a falling dollar is a loss for a forint or
+  euro investor) or USD; *Period* – All, 1Y, YTD, 6M, 3M, 1M (the volatility of the last three months is not the
+  volatility of the lifespan); *Risk‑free rate (% p.a.)* – per currency, remembered, **0 by default**, so that the Sharpe
+  family is then the plain ratio of return to risk. The benchmark (VUAA by default) is converted the same way.
+
+| Metric | Definition |
+|---|---|
+| **Annualised volatility** | sample standard deviation of the daily returns × √252 |
+| **Downside deviation** | √(mean of min(r − m, 0)²) × √252 over all observations, `m` = daily risk‑free rate `(1 + rf)^(1/252) − 1` |
+| **Maximum drawdown** | the largest fall of the wealth index from a previous peak – with the peak, trough and recovery date (or *not recovered yet*); the **current drawdown** is today's distance from the peak |
+| **Sharpe ratio** | `(mean(r) − m) / stdev(r) × √252` |
+| **Sortino ratio** | `(mean(r) − m) / downside deviation × √252` |
+| **Calmar ratio** | annualised return / \|maximum drawdown\| |
+| **Annualised return** | `(1 + time‑weighted return)^(1 / years) − 1`, years = calendar days / days per year (§4); shown once the window is three months old |
+| **Daily Value at Risk (95 %)** | the 5th percentile of the daily returns, as a positive loss: on 95 % of the days the loss was smaller (historical, 1 day) |
+| **Daily expected shortfall (95 %)** | the average loss on the worst 5 % of the days |
+| **Best / worst day, days with a gain** | extremes and share of positive days |
+| **Beta · correlation** | `cov(r, r_b) / var(r_b)` and the correlation of the daily returns with the benchmark's on the same days |
+| **Alpha (Jensen)** | `(mean(r − m) − β · mean(r_b − m)) × 252` |
+| **Tracking error · information ratio** | `stdev(r − r_b) × √252` and `mean(r − r_b) × 252 / tracking error` |
+| **Treynor ratio** | `(mean(r) − m) × 252 / β` |
+
+* **On screen**: eight cards (volatility, maximum drawdown, Sharpe, Sortino, time‑weighted return, Calmar, beta, Value at
+  Risk), the table of all metrics in four groups (*Return · Risk · Risk‑adjusted return · Against the benchmark*) with
+  the benchmark in a second column and a one‑line explanation per metric, and three charts: **Drawdown**, **Rolling
+  volatility** (30 trading days) and **Return distribution** (histogram with the Value at Risk line). A download button
+  saves the table as CSV.
+* **When the figures are withheld – in the open.** *No daily prices*: when less than 50 % of the stock value has a quote
+  of the last few days (the portfolio is valued at carried‑forward / purchase prices, e.g. only statement closes), no
+  metric is shown – volatility and drawdown of such a curve would be fiction – and the message says what to do (*Refresh
+  Prices*, a symbol §13, manual prices §14). 50–90 %: shown with a warning (the swings are understated). *Fewer than 20
+  observation days* in the window: only the return and the drawdown; fewer than 60: a note that the figures are
+  indicative.
+* **Excel** – sheets **Risk** and **RiskData**. `RiskData` is the observation table (date, value, net deposits and the
+  benchmark price are values written by the app; the returns, wealth index, peak, drawdown, rolling volatility and the
+  benchmark columns are formulas). `Risk` computes **every metric above with a formula over those columns** – only
+  classic functions (`STDEV`, `PERCENTILE`, `SLOPE`, `CORREL`, `SUMPRODUCT` …), so the numbers can be followed cell by cell
+  and checked against the app – plus two charts (drawdown, rolling volatility) per currency. The risk‑free rate cell is
+  an input: type another rate to see its effect (the app writes the saved one again at the next update). Both sheets are
+  rewritten by every *Refresh Prices*; a workbook made by an earlier version gains the three analysis sheets then.
+  **CSV** – `risk_metrics.csv` (all metrics as numbers, per currency) and `risk_daily.csv` (the observation table).
+* These are **historical** measures of the reconstructed history of §15 and share its assumptions (§9: share counts
+  from the Open Positions rule, carried‑forward prices on days without a quote, no intraday timing). They describe the
+  past and say nothing about the future.
+
 ## Changelog
+
+**1.4.0**
+
+* **Allocation and sector donut chart** (§16): new dashboard section *Portfolio analysis → Allocation breakdown* with a
+  donut chart of the portfolio by **asset class, stock type, industry sector, currency or single holding**, the table
+  behind it, the concentration of the portfolio (largest / top 3 / top 5 / effective number of positions) and a
+  **classification editor** for your own asset classes and sectors. Sectors come from Yahoo Finance on request (button,
+  cached in the archive – *Refresh Prices* is unchanged), because IBKR statements carry none.
+* **Risk and risk‑adjusted return metrics** (§17): *Portfolio analysis → Risk & return* – annualised volatility,
+  downside deviation, maximum drawdown (with peak, trough and recovery date), Sharpe, Sortino and Calmar ratios,
+  annualised return, daily Value at Risk and expected shortfall, best / worst day, and – against the benchmark – beta,
+  correlation, alpha, tracking error, information ratio and Treynor ratio. Computed from the **time‑weighted daily
+  returns** of the full‑lifespan history (deposits and withdrawals taken out), in the base currency or in USD, for a
+  period of your choice and with a risk‑free rate per currency; with drawdown, rolling‑volatility and return‑distribution
+  charts. The figures are withheld, with the reason, when there are no daily prices or too few observation days.
+* **Excel**: three new sheets – **Allocation** (native donut charts, formulas that read Sections 6 and 7), **Risk** (every
+  metric as a formula, two charts per currency) and **RiskData** (the observation days) – written by the first
+  *Refresh Prices* / export and kept up to date in place. **CSV**: `allocation.csv`, `holdings.csv`,
+  `risk_metrics.csv`, `risk_daily.csv`; the risk table can also be downloaded from the dashboard.
+* Nothing that existed changed: the `Portfolio` sheet (Sections 1–10), `Prices`, `FX`, `Benchmark`, `History`, `Checks`,
+  every figure and every setting are exactly as in 1.3.0 – all 486 existing tests pass, three of them extended only to
+  know the new sheets and the new tab. Workbooks of version 1.3 stay valid and gain the three sheets at their next
+  refresh; the archive database is upgraded automatically (new table `instrument_profiles`, two new optional settings:
+  the classification and the risk‑free rates). The *Risk* sheet of the example workbook is built from statement prices
+  only – see §9 for what that means for the risk metrics. 104 new tests (590 in all).
 
 **1.3.0**
 

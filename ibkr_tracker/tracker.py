@@ -15,12 +15,14 @@ from datetime import date
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from . import allocation as alloc
+from . import analytics
 from .calc import Metrics, compute_metrics
 from .config import hide_closed_dust, output_dir
 from .excel import (MissingMarketData, WorkbookLocked, WorkbookUpdate, find_soffice, open_current, refresh_workbook,
                     sync_overrides)
 from .history import History, build_history
-from .market import MarketData, MarketDataService, RefreshReport
+from .market import MarketData, MarketDataService, ProfileReport, RefreshReport
 from .market import manual as manual_prices
 from .market import mapping as ticker_mapping
 from .market.providers import PriceProvider
@@ -71,6 +73,8 @@ class Snapshot:
     accounts: list[AccountSummary] = field(default_factory=list)            # consolidated view: breakdown
     account_checks: dict[str, list[CheckRow]] = field(default_factory=dict)   # consolidated view: per-account checks
     _history: Optional[History] = field(default=None, repr=False, compare=False)
+    _holdings: Optional[list] = field(default=None, repr=False, compare=False)
+    _risk: dict = field(default_factory=dict, repr=False, compare=False)
 
     def history(self) -> Optional[History]:
         """The portfolio reconstructed day by day from its first transaction to the valuation date (see
@@ -81,6 +85,37 @@ class Snapshot:
             self._history = build_history(self.portfolio, self.md, self.metrics,
                                           float(self.settings.get("days_per_year") or 365))
         return self._history
+
+    def holdings(self) -> list[alloc.Holding]:
+        """The stocks held now and the cash balances, each with its asset class, stock type and industry sector (the
+        sectors come from the user's own entries first, then from the cached Yahoo profiles - see
+        :mod:`ibkr_tracker.allocation`).  Honours the view filter; computed once per snapshot."""
+        if self.metrics is None:
+            return []
+        if self._holdings is None:
+            self._holdings = alloc.classify(self.portfolio, self.metrics, self.settings, self.md.profiles,
+                                            hide_closed_dust(self.settings))
+        return self._holdings
+
+    def allocation(self, by: str) -> alloc.Allocation:
+        """Weights of :meth:`holdings` grouped by ``by`` (a key of :data:`ibkr_tracker.allocation.GROUPINGS`)."""
+        return alloc.allocate(self.holdings(), by)
+
+    def risk(self, unit: str = "usd", since: Optional[date] = None,
+             risk_free: Optional[float] = None) -> analytics.RiskReport:
+        """Risk and risk-adjusted return from the day-by-day history, in USD or the base currency, from ``since`` (``None``
+        = the whole lifespan) to the valuation date.  ``risk_free`` is the annual rate as a fraction; by default the one
+        entered for that currency (``settings["risk_free"]``, 0 when none)."""
+        h = self.history()
+        u = analytics.unit_of(h, unit) if h is not None else "usd"
+        if risk_free is None:
+            ccy = h.base_currency if (h is not None and u == "base") else "USD"
+            risk_free = analytics.risk_free_rate(self.settings, ccy)
+        key = (u, since, risk_free)
+        if key not in self._risk:
+            self._risk[key] = analytics.risk_report(h, self.md, u, risk_free, since,
+                                                    float(self.settings.get("days_per_year") or 365))
+        return self._risk[key]
 
 
 @dataclass
@@ -104,6 +139,18 @@ class MappingOutcome:
     errors: list[str] = field(default_factory=list)           # edits that were rejected
     report: Optional[RefreshReport] = None                    # the download of the changed symbols (if requested)
     messages: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProfileOutcome:
+    """Result of *Look up sectors*."""
+    report: Optional[ProfileReport] = None
+    messages: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
 
 
 class Tracker:
@@ -369,6 +416,40 @@ class Tracker:
 
     def delete_manual_prices(self, key: str, days=None) -> int:
         return self.store.delete_manual_prices(key, days)
+
+    # ---- sectors and classification (allocation) ------------------------------------------------------------------
+    def lookup_profiles(self, account: str, progress: Optional[Callable[[int, int, str], None]] = None,
+                        force: bool = False) -> ProfileOutcome:
+        """Ask Yahoo Finance for the sector of every stock held (an explicit action - *Refresh Prices* does not do it).
+        The answers are cached in the archive; stocks that already have one are not asked again unless ``force``."""
+        out = ProfileOutcome()
+        settings = self.settings()
+        p = self.portfolio(account, settings)
+        if p is None:
+            out.errors.append("No statements imported yet.")
+            return out
+        out.report = self.service.refresh_profiles(p, settings, progress, force)
+        out.messages.append(out.report.summary())
+        out.messages.extend(out.report.messages)
+        for key, err in out.report.errors.items():
+            out.errors.append(f"{key.split('|')[0]}: {err}")
+        return out
+
+    def save_classification(self, holdings: list[alloc.Holding],
+                            edits: dict[str, tuple[str, str]]) -> alloc.ClassificationChange:
+        """Persist the asset classes / sectors typed into the classification table (``{"TICKER|CCY": (asset class,
+        sector)}`` of the shown rows).  An entry that equals the automatic value is not stored."""
+        settings = self.settings()
+        change = alloc.apply_classification_edits(settings, holdings, edits)
+        if change.changed:
+            self.update_settings(classification=change.classification)
+        return change
+
+    def set_risk_free(self, currency: str, percent: float) -> dict:
+        """Remember the annual risk-free rate (in percent) used for ``currency`` in the Sharpe / Sortino / alpha figures."""
+        rates = dict(self.settings().get("risk_free") or {})
+        rates[currency] = float(percent)
+        return self.update_settings(risk_free=rates)
 
     # ---- CSV export --------------------------------------------------------------------------------------
     def csv_files(self, snap: Snapshot, style: Optional[str] = None) -> dict[str, bytes]:

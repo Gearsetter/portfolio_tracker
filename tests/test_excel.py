@@ -70,7 +70,8 @@ def formulas(wb):
 # structure required by the task
 # ======================================================================================================
 def test_sheets(wb):
-    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "History", "Checks", "About", "_state"]
+    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "History", "Allocation", "Risk", "RiskData", "Checks", "About",
+                           "_state"]
     assert wb["_state"].sheet_state == "hidden" and wb.active.title == "Portfolio"
     assert wb.calculation.fullCalcOnLoad is True
     assert wb.properties.title == "IBKR portfolio U24013787"
@@ -205,10 +206,13 @@ def test_key_formulas_follow_the_specification(ws, lay):
 
 def test_only_widely_supported_functions(wb):
     allowed = {"SUM", "SUMIFS", "SUMPRODUCT", "INDEX", "MATCH", "IF", "IFERROR", "ABS", "INT", "N", "COUNTIF"}
-    used = set()
-    for _, _, f in formulas(wb):
-        used |= {t.value[:-1].upper() for t in Tokenizer(f).items if t.type == "FUNC" and t.subtype == "OPEN"}
+    analysis = allowed | {"COUNTIFS", "SUMIF", "MAX", "LARGE", "FIXED", "ROUND"}                    # the Allocation sheet (see test_excel_analysis)
+    used, used_analysis = set(), set()
+    for sheet, _, f in formulas(wb):
+        found = {t.value[:-1].upper() for t in Tokenizer(f).items if t.type == "FUNC" and t.subtype == "OPEN"}
+        (used_analysis if sheet in ("Allocation", "Risk", "RiskData") else used).update(found)
     assert used and used <= allowed, sorted(used - allowed)                       # no XLOOKUP / FILTER / LET / dynamic arrays
+    assert used_analysis <= analysis, sorted(used_analysis - analysis)
 
 
 def test_every_name_used_in_a_formula_is_defined(wb):

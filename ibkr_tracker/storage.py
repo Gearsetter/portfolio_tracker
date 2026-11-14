@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS manual_prices(
     key TEXT NOT NULL, day TEXT NOT NULL, price REAL NOT NULL, source TEXT, imported_at TEXT,
     PRIMARY KEY(key, day)
 );
+CREATE TABLE IF NOT EXISTS instrument_profiles(
+    key TEXT PRIMARY KEY, symbol TEXT, sector TEXT, industry TEXT, quote_type TEXT, name TEXT, fetched_at TEXT
+);
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS snapshots(
     account TEXT NOT NULL, as_of TEXT NOT NULL, taken_at TEXT NOT NULL,
@@ -232,6 +235,34 @@ class Store:
                 cur = c.executemany("DELETE FROM manual_prices WHERE key=? AND day=?",
                                     [(key, d.isoformat()) for d in days])
             return cur.rowcount
+
+    # ---- instrument profiles (the sector Yahoo Finance reports for a stock; looked up on request) -------------------
+    def save_profile(self, key: str, symbol: str, sector: str = "", industry: str = "", quote_type: str = "",
+                     name: str = "") -> None:
+        """Cache the profile of ``key`` (``"TICKER|CCY"``) as Yahoo reported it for ``symbol``."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO instrument_profiles(key, symbol, sector, industry, quote_type, name, fetched_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET symbol=excluded.symbol, sector=excluded.sector, "
+                "industry=excluded.industry, quote_type=excluded.quote_type, name=excluded.name, "
+                "fetched_at=excluded.fetched_at",
+                (key, symbol, sector, industry, quote_type, name, datetime.now().isoformat(timespec="seconds")))
+
+    def get_profiles(self) -> dict[str, dict]:
+        """``{"TICKER|CCY": {symbol, sector, industry, quote_type, name, fetched_at}}`` of every cached profile."""
+        with self._conn() as c:
+            rows = c.execute("SELECT key, symbol, sector, industry, quote_type, name, fetched_at "
+                             "FROM instrument_profiles ORDER BY key").fetchall()
+        return {r["key"]: {"symbol": r["symbol"] or "", "sector": r["sector"] or "", "industry": r["industry"] or "",
+                           "quote_type": r["quote_type"] or "", "name": r["name"] or "",
+                           "fetched_at": r["fetched_at"] or ""} for r in rows}
+
+    def delete_profiles(self, keys: Optional[Sequence[str]] = None) -> int:
+        """Forget the cached profiles - all of them, or only those of ``keys``.  Returns the row count."""
+        with self._conn() as c:
+            if keys is None:
+                return c.execute("DELETE FROM instrument_profiles").rowcount
+            return c.executemany("DELETE FROM instrument_profiles WHERE key=?", [(k,) for k in keys]).rowcount
 
     # ---- history of portfolio values (one row per valuation date, replaced when recomputed) -----------------
     def save_snapshot(self, account: str, as_of: date, values: dict) -> None:

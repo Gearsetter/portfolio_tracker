@@ -18,6 +18,9 @@ PRICES = "Prices"
 FXSHEET = "FX"
 BENCH = "Benchmark"
 HISTORY = "History"                   # day-by-day reconstruction of the whole lifespan (values + charts)
+ALLOCATION = "Allocation"             # donut charts, concentration and the classification of every holding
+RISK = "Risk"                         # risk and risk-adjusted-return metrics (formulas over the RiskData sheet) + charts
+RISKDATA = "RiskData"                 # the observation days behind the Risk sheet: returns, wealth index, drawdown
 CHECKS = "Checks"
 ABOUT = "About"
 

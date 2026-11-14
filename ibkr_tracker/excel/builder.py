@@ -179,6 +179,8 @@ def build_workbook(portfolio: Portfolio, md: MarketData, settings: dict, generat
     _write_history(wsh, portfolio, md, hist)
     _write_portfolio(ws, wb, portfolio, md, lay, base, positions, currencies, hide)
     _write_checks(wsc, portfolio, md, lay, positions, currencies, base, hide)
+    from . import analysis_sheets as AS                                 # (imported here: it needs this module's helpers)
+    AS.write_analysis_sheets(wb, portfolio, md, settings, lay, hist, hide)
     _write_about(wsa, portfolio, md, lay, base, generated_at, hide, hist.notes)
     _define_names(wb, lay, positions, currencies, fx_cols)
     write_state(wb, portfolio, md, settings)
@@ -884,6 +886,12 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
                           "reconstructed by the app (values, not formulas) from the transactions, the daily price series "
                           "(manual price history > Yahoo Finance > statement closes) and the daily FX rates. The last "
                           "row equals the totals of Sections 8-9; the charts above the table are redrawn on every refresh."),
+        ("Allocation sheet", "Donut charts by asset class, stock type, sector and currency, the concentration figures and "
+                             "the classification of every holding. USD values are formulas on Sections 6-7; the labels "
+                             "are written by the app."),
+        ("Risk sheets", "Volatility, maximum drawdown, Sharpe / Sortino / Calmar, Value at Risk and beta / alpha against "
+                        "the benchmark: formulas over the daily time-weighted returns of the RiskData sheet (deposits "
+                        "taken out). They need daily prices."),
     ]
     for k, v in notes:
         _put(ws, f"A{r}", k, font=F_BOLD, border=None)
@@ -1052,6 +1060,8 @@ def refresh_market_sheets(wb: Workbook, p: Portfolio, md: MarketData, settings: 
         wsh = wb.create_sheet(L.HISTORY, wb.sheetnames.index(L.BENCH) + 1)
         wsh.sheet_view.showGridLines = False
     _write_history(wsh, p, md, hist)
+    from . import analysis_sheets as AS                                 # Allocation / Risk / RiskData: rewritten (or added
+    AS.write_analysis_sheets(wb, p, md, settings, lay, hist, hide)     # to a workbook of an older version) in place
     _write_about(_fresh_sheet(wb, L.ABOUT), p, md, lay, base, generated_at, hide, hist.notes)
     _define_names(wb, lay, positions, currencies, fx_cols)
     write_state(wb, p, md, settings)
