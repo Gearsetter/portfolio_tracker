@@ -83,7 +83,10 @@ def test_dashboard_for_the_imported_account(gui):
     k = kpis(at)
     assert k["Total value (USD)"] == "9,641.10 USD" and k["Net deposits (HUF)"] == "2,800,000 HUF"
     assert k["Return (HUF)"].endswith("x") and k["CAGR (USD)"].endswith("%") and k["Stocks (USD)"] == "9,608.62 USD"
-    assert k["VUAA instead (USD)"] == "n/a"                                           # nothing downloaded yet
+    assert k["VUAA instead (USD)"] == "n/a" and k["VUAA CAGR (USD)"] == "n/a"        # nothing downloaded yet
+    assert "Stocks minus VUAA (USD)" not in k                                         # no longer a primary KPI ...
+    secondary = [m.value for m in at.markdown if "sec-label" in m.value]
+    assert any("Stocks minus VUAA (USD)" in v for v in secondary)                    # ... but in the secondary card
     assert sidebar_widget(at, "selectbox", "account").value == ACCOUNT
     assert sidebar_widget(at, "toggle", "w_export").value is True                    # export toggle defaults to on
     assert "base currency HUF" in " ".join(texts(at.caption))
@@ -102,7 +105,10 @@ def test_refresh_prices_downloads_exports_and_updates_in_place(gui):
     assert any("Refresh: Excel workbook created" in s.value for s in at.success)
     k = kpis(at)
     assert k["Total value (USD)"] != "9,641.10 USD" and k["VUAA instead (USD)"] != "n/a"
-    assert k["Stocks minus VUAA (USD)"] != "n/a"
+    assert k["VUAA CAGR (USD)"] != "n/a" and k["VUAA CAGR (USD)"].endswith("%")      # the primary benchmark figure
+    assert "Stocks minus VUAA (USD)" not in k
+    secondary = " ".join(m.value for m in at.markdown if "sec-label" in m.value)
+    assert "Stocks minus VUAA (USD)" in secondary and "n/a</div>" not in secondary.split("Stocks minus")[1][:200]
     assert "Valuation date 2026-10-30" in " ".join(texts(at.caption))
     first_mtime = out.stat().st_mtime_ns
 

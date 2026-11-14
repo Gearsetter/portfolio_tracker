@@ -10,6 +10,11 @@ Definitions (identical to the spreadsheet):
 * Section 5 columns M/N/O convert at the **purchase-date** rate, Section 6 column O at the **latest** rate.
 * Time-weighted CAGR = ``Return ** (1 / weighted average years since deposits) - 1`` with the deposits'
   USD amounts as weights (interest rows are not contributions and are excluded).
+* Share counts (Section 6, column K) are the **Open Positions of the latest statement**, never the transaction sum
+  (stock splits!).  ``share_factor`` = statement shares / transaction sum converts the quantity of a transaction into
+  today's shares for the "Current Total" columns, so that they add up to the value of the position.
+* VUAA CAGR (USD): every stock transaction replayed into the benchmark ETF (Section 5, column P);
+  ``(VUAA value / invested) ** (1 / purchase-weighted average years) - 1`` with the USD Totals as weights.
 """
 from __future__ import annotations
 
@@ -37,6 +42,7 @@ class TradeRow:
     usd_current: Optional[float]         # current total converted at the purchase-date rate
     bench_close: Optional[float]
     vuaa_qty: Optional[float]
+    share_factor: float = 1.0            # statement shares / transaction sum of this position (1 unless a split...)
 
 
 @dataclass
@@ -52,6 +58,8 @@ class PositionRow:
     usd_value: float
     usd_gross: float
     usd_ret: Optional[float]
+    tx_quantity: float = 0.0             # sum of the transactions (NOT the share count)
+    share_factor: float = 1.0
 
 
 @dataclass
@@ -71,6 +79,7 @@ class DepositRow:
     rate: float                          # base currency units per USD on that day (the "USD.HUF" column)
     usd_amount: float
     base_amount: float
+    account: str = ""
 
 
 @dataclass
@@ -87,6 +96,9 @@ class BenchmarkResult:
     ret_stocks_latest: Optional[float] = None
     ret_vuaa: Optional[float] = None
     excess_usd: Optional[float] = None
+    years: Optional[float] = None            # purchase-weighted average years from the transactions to the as-of date
+    cagr_vuaa: Optional[float] = None        # VUAA CAGR in USD  (the dashboard's primary benchmark figure)
+    cagr_stocks: Optional[float] = None      # stocks CAGR on the very same basis (latest FX)
 
 
 @dataclass
@@ -121,13 +133,18 @@ def compute_metrics(portfolio: Portfolio, md: MarketData, days_per_year: float =
     base = portfolio.base_currency
     fx = md.fx
 
+    held = portfolio.net_quantities()                  # share counts: Open Positions of the latest statement
+    tx_qty = portfolio.transaction_quantities()
+    factors = portfolio.share_factors()
+
     # ---- Section 1 + 5 (per transaction) -----------------------------------------------------------------
     trade_rows: list[TradeRow] = []
     for t in portfolio.trades:
         total = t.quantity * t.price
         gross = total + t.fee
+        factor = factors.get((t.ticker, t.currency), 1.0)
         cur_price = md.price(t.ticker, t.currency)
-        cur_total = t.quantity * cur_price if cur_price is not None else None
+        cur_total = t.quantity * factor * cur_price if cur_price is not None else None
         day = t.dt.date()
         rate = fx.rate(t.currency, day) if fx.has(t.currency) else float("nan")
         bench = md.benchmark.close(day)
@@ -136,13 +153,13 @@ def compute_metrics(portfolio: Portfolio, md: MarketData, days_per_year: float =
             trade=t, total=total, gross=gross, current_price=cur_price, current_total=cur_total, fx_rate=rate,
             usd_total=usd_total, usd_gross=gross / rate,
             usd_current=(cur_total / rate) if cur_total is not None else None,
-            bench_close=bench, vuaa_qty=(usd_total / bench) if bench and bench > 0 else None))
+            bench_close=bench, vuaa_qty=(usd_total / bench) if bench and bench > 0 else None, share_factor=factor))
 
     # ---- Section 6 (positions) --------------------------------------------------------------------------
     positions: list[PositionRow] = []
     for ticker, ccy in portfolio.positions_keys():
         rows = [r for r in trade_rows if r.trade.ticker == ticker and r.trade.currency == ccy]
-        qty = sum(r.trade.quantity for r in rows)
+        qty = held.get((ticker, ccy), 0.0)
         gross = sum(r.gross for r in rows)
         usd_gross = sum(r.usd_gross for r in rows)
         price = md.price(ticker, ccy)
@@ -152,7 +169,8 @@ def compute_metrics(portfolio: Portfolio, md: MarketData, days_per_year: float =
             ticker=ticker, currency=ccy, name=portfolio.instrument_name(ticker), quantity=qty, price=price,
             value=value, gross=gross, ret=(value / gross) if qty != 0 and gross else None,
             usd_value=usd_value, usd_gross=usd_gross,
-            usd_ret=(usd_value / usd_gross) if qty != 0 and usd_gross else None))
+            usd_ret=(usd_value / usd_gross) if qty != 0 and usd_gross else None,
+            tx_quantity=tx_qty.get((ticker, ccy), 0.0), share_factor=factors.get((ticker, ccy), 1.0)))
 
     # ---- Section 7 (cash) -------------------------------------------------------------------------------
     balances = portfolio.cash_balances()
@@ -172,7 +190,7 @@ def compute_metrics(portfolio: Portfolio, md: MarketData, days_per_year: float =
         else:
             usd = c.amount / fx.rate(c.currency, day)
         base_amt = c.amount if c.currency == base else usd * rate
-        deposits.append(DepositRow(c.kind, c.description, c.currency, day, c.amount, rate, usd, base_amt))
+        deposits.append(DepositRow(c.kind, c.description, c.currency, day, c.amount, rate, usd, base_amt, c.account))
 
     contributions = [d for d in deposits if d.kind not in CONTRIBUTION_EXCLUDED]
     usd_dep = sum(d.usd_amount for d in contributions)
@@ -206,6 +224,10 @@ def compute_metrics(portfolio: Portfolio, md: MarketData, days_per_year: float =
         bench.ret_vuaa = bench.value_usd / invested if invested else None
     bench.ret_stocks_const = const_fx / invested if invested else None
     bench.ret_stocks_latest = stocks_usd / invested if invested else None
+    if invested:
+        bench.years = sum(r.usd_total * (md.as_of - r.trade.dt.date()).days for r in trade_rows) / invested / days_per_year
+    bench.cagr_vuaa = _cagr(bench.ret_vuaa, bench.years)
+    bench.cagr_stocks = _cagr(bench.ret_stocks_latest, bench.years)
 
     return Metrics(
         base_currency=base, as_of=md.as_of, trades=trade_rows, positions=positions, cash=cash, deposits=deposits,

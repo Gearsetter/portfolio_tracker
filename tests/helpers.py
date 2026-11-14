@@ -61,7 +61,7 @@ def compare_portfolio_sheet(vals: dict[str, Any], p: Portfolio, m: Metrics,
         if vals.get(f"J{row}") != pos.ticker:
             bad.append(f"J{row}: ticker {vals.get(f'J{row}')!r} != {pos.ticker!r}")
         for col, exp in (("K", pos.quantity), ("L", pos.price), ("M", pos.value), ("N", pos.ret),
-                         ("O", pos.usd_value), ("P", pos.usd_ret)):
+                         ("O", pos.usd_value), ("P", pos.usd_ret), ("S", pos.tx_quantity), ("T", pos.share_factor)):
             chk(f"{col}{row}", exp)
     for i, c in enumerate(m.cash):
         row = lay.cash_first + i
@@ -91,6 +91,13 @@ def compare_portfolio_sheet(vals: dict[str, Any], p: Portfolio, m: Metrics,
     else:
         if vals.get(f"K{base_row + 7}") != "n/a":
             bad.append(f"K{base_row + 7}: expected 'n/a' without benchmark prices, got {vals.get(f'K{base_row + 7}')!r}")
+    for off, exp in ((10, b.years), (11, b.cagr_vuaa), (12, b.cagr_stocks)):        # years, VUAA CAGR, stocks CAGR
+        ref = f"K{base_row + off}"
+        if exp is None:
+            if vals.get(ref) != "n/a":
+                bad.append(f"{ref}: expected 'n/a', got {vals.get(ref)!r}")
+        else:
+            chk(ref, exp)
     return bad
 
 

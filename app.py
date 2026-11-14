@@ -24,7 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ibkr_tracker import __version__                                   # noqa: E402
 from ibkr_tracker import tables as T                                   # noqa: E402
+from ibkr_tracker.exports import CSV_STYLE_LABELS, CSV_STYLES, csv_style  # noqa: E402
 from ibkr_tracker.market.symbols import yahoo_symbol                   # noqa: E402
+from ibkr_tracker.portfolio import CONSOLIDATED, CONSOLIDATED_LABEL    # noqa: E402
 from ibkr_tracker.reconcile import overall                             # noqa: E402
 from ibkr_tracker.tracker import RunOutcome, Snapshot, Tracker         # noqa: E402
 
@@ -133,11 +135,12 @@ def sidebar(tracker: Tracker) -> tuple[Optional[str], dict, bool]:
                     flash("warning", f"{r.filename}: {w}")
             touched = sorted({r.account for r in results if r.ok})
             if touched:
-                st.session_state["account"] = touched[0]
-                tracker.update_settings(last_account=touched[0])
+                if st.session_state.get("account") != CONSOLIDATED:        # stay in the consolidated view if it is open
+                    st.session_state["account"] = touched[0]
+                    tracker.update_settings(last_account=touched[0])
                 if any(r.is_new for r in results) and settings.get("export_excel"):
                     with st.spinner("Updating the Excel workbook ..."):
-                        post_outcome(tracker.export(touched[0]), "Import")
+                        post_outcome(tracker.export(st.session_state["account"]), "Import")
             st.session_state["uploader_nonce"] = nonce + 1
             st.rerun()
 
@@ -145,11 +148,15 @@ def sidebar(tracker: Tracker) -> tuple[Optional[str], dict, bool]:
         accounts = tracker.accounts()
         account: Optional[str] = None
         if accounts:
-            labels = {a: a + (f"  ·  {alias}" if alias else "") for a, alias, _ in accounts}
-            options = list(labels)
+            labels = {CONSOLIDATED: "∑  " + CONSOLIDATED_LABEL}
+            labels.update({a: a + (f"  ·  {alias}" if alias else "") for a, alias, _ in accounts})
+            options = tracker.account_choices()                 # the consolidated view first, then every account
             if st.session_state.get("account") not in options:
                 st.session_state["account"] = tracker.default_account()
-            account = st.selectbox("Account", options, format_func=labels.get, key="account")
+            account = st.selectbox(
+                "Account / view", options, format_func=labels.get, key="account",
+                help="Inspect one account on its own, or choose 'All accounts (consolidated)' to merge every account "
+                     "into a single portfolio: positions, cash, performance and transaction histories.")
             if account != settings.get("last_account"):
                 settings = tracker.update_settings(last_account=account)
         else:
@@ -179,6 +186,11 @@ def sidebar(tracker: Tracker) -> tuple[Optional[str], dict, bool]:
                                                       "FX rate), e.g. VUAA.L, VUAA.MI, SPY.")
             days = st.number_input("Days per year (CAGR)", min_value=360.0, max_value=366.0, step=0.25,
                                    value=float(settings.get("days_per_year", 365)), key="w_days")
+            cons_base = st.text_input(
+                "Base currency of the consolidated view", value=settings.get("consolidated_base", ""), max_chars=3,
+                placeholder="auto", key="w_consbase",
+                help="Currency of the 'base currency' summary when all accounts are merged. Empty = the accounts' "
+                     "common base currency, or USD when they differ.")
             out_dir = st.text_input("Output folder (empty = <data folder>/output)", value=settings.get("output_dir", ""),
                                     key="w_outdir")
             st.caption(f"Data folder: `{tracker.store.path.parent}`  (set IBKR_TRACKER_HOME to change)")
@@ -190,6 +202,7 @@ def sidebar(tracker: Tracker) -> tuple[Optional[str], dict, bool]:
                                       + ("" if lo_ok else " LibreOffice was not found on this computer."))
         new = dict(export_excel=bool(export), price_source=source, benchmark_symbol=bench.strip() or "VUAA.L",
                    days_per_year=float(days), output_dir=out_dir.strip(),
+                   consolidated_base=(cons_base.strip().upper() if len(cons_base.strip()) == 3 else ""),
                    recalc_with_libreoffice=bool(recalc) if lo_ok else bool(settings.get("recalc_with_libreoffice")))
         if any(settings.get(k) != v for k, v in new.items()):
             was_on = bool(settings.get("export_excel"))
@@ -203,6 +216,29 @@ def sidebar(tracker: Tracker) -> tuple[Optional[str], dict, bool]:
 # ======================================================================================================
 # dashboard
 # ======================================================================================================
+def secondary_benchmark_card(b, bench_label: str) -> None:
+    """Small overview card under the KPI grid: the benchmark figures that are not part of the headline numbers
+    (among them 'Stocks minus VUAA', which the primary slot gave up for the VUAA CAGR)."""
+    def cell(col, label: str, value: str, tip: str = "") -> None:
+        col.markdown(f"<div class='sec-label' title='{tip}'>{label}</div><div class='sec-value'>{value}</div>",
+                     unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.caption("Benchmark comparison · details")
+        c = st.columns(4)
+        if b.available:
+            cell(c[0], f"Stocks minus {bench_label} (USD)", fmt_money(b.excess_usd, "USD"),
+                 "Value of the stock positions minus the simulated benchmark position.")
+        else:
+            cell(c[0], f"Stocks minus {bench_label} (USD)", "n/a", "Needs benchmark prices (Refresh Prices).")
+        cell(c[1], "Stocks CAGR (USD, same basis)", fmt_pct(b.cagr_stocks, signed=False),
+             "Stocks value / invested, annualised over the same purchase-weighted years as the benchmark CAGR.")
+        cell(c[2], f"{bench_label} return (USD)", fmt_mult(b.ret_vuaa) if b.available else "n/a",
+             "Simulated benchmark value / amount invested in stocks.")
+        cell(c[3], "Avg. years since purchases", f"{b.years:.3f}" if b.years else "n/a",
+             "Purchase-weighted average time from each stock transaction to the valuation date.")
+
+
 def dashboard(snap: Snapshot) -> None:
     m, md, p, s = snap.metrics, snap.md, snap.portfolio, snap.settings
     base = m.base_currency
@@ -217,12 +253,14 @@ def dashboard(snap: Snapshot) -> None:
     kpi(c[3], "CAGR (USD)", fmt_pct(m.usd_cagr, signed=False),
         help="Time-weighted: Return^(1/years) - 1 with years = deposit-weighted average time since the deposits "
              f"({m.years:.3f} y)." if m.years else "n/a")
-    c = st.columns(4)
-    kpi(c[0], f"Total value ({base})", fmt_money(m.base_total, base, 0), help="Total USD value x latest USD rate.")
-    kpi(c[1], f"Net deposits ({base})", fmt_money(m.base_deposits, base, 0))
-    kpi(c[2], f"Return ({base})", fmt_mult(m.base_return), fmt_pct(None if m.base_return is None else m.base_return - 1),
-        help="Includes the currency effect: deposits are valued at the rate of their day.")
-    kpi(c[3], f"CAGR ({base})", fmt_pct(m.base_cagr, signed=False))
+    if base != "USD":                                  # with a USD base this row would only repeat the one above
+        c = st.columns(4)
+        kpi(c[0], f"Total value ({base})", fmt_money(m.base_total, base, 0), help="Total USD value x latest USD rate.")
+        kpi(c[1], f"Net deposits ({base})", fmt_money(m.base_deposits, base, 0))
+        kpi(c[2], f"Return ({base})", fmt_mult(m.base_return),
+            fmt_pct(None if m.base_return is None else m.base_return - 1),
+            help="Includes the currency effect: deposits are valued at the rate of their day.")
+        kpi(c[3], f"CAGR ({base})", fmt_pct(m.base_cagr, signed=False))
 
     b = m.benchmark
     c = st.columns(4)
@@ -233,12 +271,33 @@ def dashboard(snap: Snapshot) -> None:
             fmt_pct(None if b.ret_vuaa is None else b.ret_vuaa - 1),
             help=f"Every stock purchase's USD total invested in {s.get('benchmark_symbol')} on the same day "
                  f"({b.units:,.4f} units) and valued at {b.price:,.2f} USD.")
-        kpi(c[3], f"Stocks minus {bench_label} (USD)", fmt_money(b.excess_usd, "USD"),
-            help="Value of the stock positions minus the simulated benchmark position.")
+        kpi(c[3], f"{bench_label} CAGR (USD)", fmt_pct(b.cagr_vuaa, signed=False),
+            help=f"Time-weighted: (benchmark value / invested)^(1/years) - 1 in USD, years = purchase-weighted average "
+                 f"time since the stock purchases ({b.years:.3f} y)." if b.years else
+                 "Needs stock transactions and benchmark prices.")
     else:
         kpi(c[2], f"{bench_label} instead (USD)", "n/a")
-        kpi(c[3], f"Stocks minus {bench_label} (USD)", "n/a", help="Needs benchmark prices: press Refresh Prices "
-                                                                    "(or enter a manual benchmark price).")
+        kpi(c[3], f"{bench_label} CAGR (USD)", "n/a", help="Needs benchmark prices: press Refresh Prices "
+                                                            "(or enter a manual benchmark price).")
+    secondary_benchmark_card(b, bench_label)
+
+    if p.is_consolidated and snap.accounts:
+        st.markdown("#### Accounts")
+        acc = T.accounts_table(snap.accounts)
+        for col in ("Share of total", "CAGR (USD)"):                       # fractions -> percent for display
+            acc[col] = pd.to_numeric(acc[col], errors="coerce") * 100
+        show_df(acc, column_config={
+            "Stocks (USD)": st.column_config.NumberColumn(format="%.2f"),
+            "Cash (USD)": st.column_config.NumberColumn(format="%.2f"),
+            "Total value (USD)": st.column_config.NumberColumn(format="%.2f"),
+            "Share of total": st.column_config.NumberColumn(format="%.1f%%"),
+            "Net deposits (USD)": st.column_config.NumberColumn(format="%.2f"),
+            "Return (USD)": st.column_config.NumberColumn(format="%.4fx"),
+            "CAGR (USD)": st.column_config.NumberColumn(format="%.2f%%"),
+            "Total value (account base)": st.column_config.NumberColumn(format="%.2f"),
+            "Statement to": st.column_config.DateColumn(format="YYYY-MM-DD")})
+        st.caption("Each account valued with the same prices and FX rates as the consolidated totals above; "
+                   "'Total value (account base)' is in that account's own base currency.")
 
     st.markdown("#### Positions")
     pos = T.positions_table(m)
@@ -274,7 +333,10 @@ def dashboard(snap: Snapshot) -> None:
         st.line_chart(hist.rename(columns={"usd_total": "Total value (USD)", "usd_deposits": "Net deposits (USD)"}),
                       x="as_of", y=["Total value (USD)", "Net deposits (USD)"], **stretch())
 
-    st.caption(f"Valuation date {md.as_of} · {md.mode}")
+    source = {"open_positions": "the Open Positions section of the latest statement",
+              "open_positions+transactions": "the newest Open Positions section plus the later transactions",
+              "transactions": "the sum of the transactions (no Open Positions section found)"}.get(p.holdings_source, "")
+    st.caption(f"Valuation date {md.as_of} · {md.mode}" + (f" · share counts from {source}" if source else ""))
 
 
 def tracker_history(account: str) -> list[dict]:
@@ -287,11 +349,12 @@ def tracker_history(account: str) -> list[dict]:
 def transactions(snap: Snapshot) -> None:
     m, p = snap.metrics, snap.portfolio
     base = m.base_currency
+    acct = p.is_consolidated                       # consolidated view: first column = account of the record
     t1, t2, t3, t4 = st.tabs(["1 · Stock transactions (+ 5 · extensions)", "2 · Dividends",
                               "3 · Deposits & withdrawals", "4 · Forex"])
     money = lambda: st.column_config.NumberColumn(format="%.2f")  # noqa: E731
     with t1:
-        df = T.trades_table(m)
+        df = T.trades_table(m, acct)
         show_df(df, column_config={
             "Quantity": st.column_config.NumberColumn(format="%.4f"), "Price": st.column_config.NumberColumn(format="%.4f"),
             "Total": money(), "Fee": st.column_config.NumberColumn(format="%.4f"), "Gross": money(),
@@ -300,20 +363,22 @@ def transactions(snap: Snapshot) -> None:
             "VUAA Quantity": st.column_config.NumberColumn(format="%.4f"),
             "Date": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm:ss")}, height=420)
         st.caption("Sells carry negative quantity/total. Fee is a positive cost. USD columns use the closing rate of "
-                   "the transaction day; VUAA Quantity needs benchmark prices (Refresh Prices).")
+                   "the transaction day; VUAA Quantity needs benchmark prices (Refresh Prices). Current Total is "
+                   "expressed in today's shares (statement share count / transaction sum, see Positions)."
+                   + (" The Account column shows where each record comes from." if acct else ""))
     with t2:
-        show_df(T.dividends_table(p), column_config={
+        show_df(T.dividends_table(p, acct), column_config={
             "Quantity": st.column_config.NumberColumn(format="%.4f"), "Dividend": st.column_config.NumberColumn(format="%.5f"),
             "Total": money(), "Withholding Tax": money(), "Date": st.column_config.DateColumn(format="YYYY-MM-DD")})
         st.caption("Withholding Tax includes dividend-related fees (e.g. ADR fees). Dividend, tax and fee lines of "
                    "one payment are merged into one row.")
     with t3:
-        show_df(T.deposits_table(m), column_config={
+        show_df(T.deposits_table(m, acct), column_config={
             "Amount": money(), f"USD.{base}": st.column_config.NumberColumn(format="%.4f"),
             "USD Amount": money(), f"Amount ({base})": money(), "Date": st.column_config.DateColumn(format="YYYY-MM-DD")})
         st.caption(f"USD.{base} = {base} per 1 USD on that day, so USD Amount = Amount / USD.{base}.")
     with t4:
-        show_df(T.forex_table(p), column_config={
+        show_df(T.forex_table(p, acct), column_config={
             "Quantity": st.column_config.NumberColumn(format="%.6f"), "Price": st.column_config.NumberColumn(format="%.5f"),
             "Total": money(), "Fee": st.column_config.NumberColumn(format="%.4f"),
             "Date": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm:ss")}, height=420)
@@ -329,12 +394,22 @@ def reconciliation(snap: Snapshot) -> None:
         show_df(df, column_config={c: st.column_config.NumberColumn(format="%.6f") for c in
                                    ("IBKR statement", "Workbook", "Difference", "Tolerance")})
         st.caption("NAV differences are informational (INFO): the workbook values holdings at the latest prices, "
-                   "IBKR's NAV is at the statement date.")
+                   "IBKR's NAV is at the statement date. The share counts are taken from the statement's Open "
+                   "Positions section; 'Share count' rows only show where the sum of the transactions differs "
+                   "(INFO: stock split, transfer, earlier history).")
     else:
         st.info("The newest statement has no cash report / positions to compare with.")
+    if p.is_consolidated and snap.account_checks:
+        st.markdown("#### Per account")
+        for acc, rows in snap.account_checks.items():
+            verdict = overall(rows) if rows else "nothing to compare"
+            with st.expander(f"{acc} - {verdict}", expanded=verdict not in ("all checks passed", "nothing to compare")):
+                if rows:
+                    show_df(T.checks_table(rows), column_config={c: st.column_config.NumberColumn(format="%.6f") for c in
+                                                                 ("IBKR statement", "Workbook", "Difference", "Tolerance")})
     st.markdown("#### Coverage")
-    cover = pd.DataFrame([{"File": x.filename, "Format": x.fmt.upper(), "From": x.period_start, "To": x.period_end}
-                          for x in p.statements])
+    cover = pd.DataFrame([{**({"Account": x.account} if p.is_consolidated else {}), "File": x.filename,
+                           "Format": x.fmt.upper(), "From": x.period_start, "To": x.period_end} for x in p.statements])
     show_df(cover)
     st.caption(f"{p.duplicates_dropped} duplicate transaction(s) found in overlapping statements were counted once.")
     problems = [*p.warnings, *snap.md.notes]
@@ -344,6 +419,10 @@ def reconciliation(snap: Snapshot) -> None:
         st.markdown("#### Warnings")
         for w in dict.fromkeys(problems):
             st.warning(w)
+    if p.notes:
+        st.markdown("#### Notes")
+        for n in dict.fromkeys(p.notes):
+            st.info(n)
 
 
 def market_data(tracker: Tracker, snap: Snapshot) -> None:
@@ -416,7 +495,7 @@ def market_data(tracker: Tracker, snap: Snapshot) -> None:
 
 
 def archive(tracker: Tracker, account: str) -> None:
-    st.markdown("#### Imported statements")
+    st.markdown("#### Imported statements" + (" (all accounts)" if account == CONSOLIDATED else ""))
     rows = tracker.statements(account)
     if not rows:
         st.info("Nothing imported yet.")
@@ -427,7 +506,7 @@ def archive(tracker: Tracker, account: str) -> None:
         c = st.columns([5, 1.2, 2.6, 2.4, 1.2, 1])
         c[0].write(f"**{r.filename}**")
         c[1].write(r.fmt.upper())
-        c[2].write(f"{r.period_start} → {r.period_end}")
+        c[2].write(f"{r.period_start} → {r.period_end}" + (f"  ·  {r.account}" if account == CONSOLIDATED else ""))
         c[3].write(f"imported {str(r.imported_at).replace('T', ' ')[:16]}")
         c[4].write(f"{r.n_trades} trades")
         if c[5].button("🗑", key=f"del_{r.id}", help=f"Remove {r.filename} from the archive"):
@@ -441,7 +520,10 @@ def archive(tracker: Tracker, account: str) -> None:
 def export_tab(tracker: Tracker, snap: Snapshot) -> None:
     p, s = snap.portfolio, snap.settings
     state, detail, path = tracker.workbook_status(p, s)
-    st.markdown("#### Excel workbook")
+    st.markdown("#### Excel workbook" + (" - all accounts merged" if p.is_consolidated else ""))
+    if p.is_consolidated:
+        st.caption(f"One workbook for the unified portfolio of {', '.join(p.account_ids)}: combined positions, cash, "
+                   "performance and transaction histories (Sections 1-4 carry an Account column).")
     st.write(f"`{path}`")
     if state == "current":
         st.success(f"The workbook is up to date: {detail}. *Refresh Prices* only rewrites its market-data sheets.")
@@ -470,6 +552,35 @@ def export_tab(tracker: Tracker, snap: Snapshot) -> None:
     if path.exists():
         st.caption(f"Last written {datetime.fromtimestamp(path.stat().st_mtime):%Y-%m-%d %H:%M:%S}")
 
+    st.markdown("#### CSV files")
+    if snap.metrics is None:
+        st.info("The CSV export needs the numbers - see the Market data tab.")
+        return
+    style_options = list(CSV_STYLES)
+    style = st.radio("CSV format", style_options, index=style_options.index(csv_style(s)), horizontal=True,
+                     format_func=CSV_STYLE_LABELS.get, key="w_csvformat",
+                     help="Excel under a Hungarian / German / French ... regional setting needs semicolons and a "
+                          "decimal comma to open a CSV file with a double click; everything else (pandas, R, Google "
+                          "Sheets) expects the international form.")
+    if style != s.get("csv_format"):
+        tracker.update_settings(csv_format=style)
+    files = tracker.csv_files(snap, style)
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇  Download all tables (.zip of CSV files)", data=tracker.csv_zip(snap, style),
+                       file_name=f"IBKR_Portfolio_{p.account}_csv.zip", mime="application/zip", key="download_csv_zip",
+                       **stretch())
+    if c2.button("💾  Save the CSV files to the output folder", key="save_csv", **stretch()):
+        written = tracker.write_csv(snap, style)
+        flash("success", f"{len(written)} CSV files written to {written[0].parent}")
+        st.rerun()
+    with st.expander("Single tables"):
+        for name, data in files.items():
+            st.download_button(f"⬇  {name}", data=data, file_name=f"IBKR_Portfolio_{p.account}_{name}",
+                               mime="text/csv", key=f"download_csv_{name}")
+    st.caption("UTF-8 with byte order mark (opens correctly in Excel). " +
+               ("Record tables start with an Account column; accounts.csv is the per-account breakdown."
+                if p.is_consolidated else "positions.csv has the statement share count and the transaction sum."))
+
 
 # ======================================================================================================
 # page
@@ -477,8 +588,9 @@ def export_tab(tracker: Tracker, snap: Snapshot) -> None:
 def main() -> None:
     st.set_page_config(page_title="IBKR Portfolio Tracker", page_icon="📈", layout="wide",
                        initial_sidebar_state="expanded")
-    st.markdown("<style>.block-container{padding-top:2.2rem;} div[data-testid='stMetricValue']{font-size:1.55rem;}</style>",
-                unsafe_allow_html=True)
+    st.markdown("<style>.block-container{padding-top:2.2rem;} div[data-testid='stMetricValue']{font-size:1.55rem;}"
+                ".sec-label{font-size:.78rem;opacity:.72;line-height:1.25;} .sec-value{font-size:1.05rem;font-weight:600;}"
+                "</style>", unsafe_allow_html=True)
     tracker = get_tracker()
     account, settings, refresh = sidebar(tracker)
 
@@ -514,7 +626,9 @@ def main() -> None:
         st.info("No data for this account.")
         return
     p = snap.portfolio
-    st.caption(f"{p.account}{(' · ' + p.alias) if p.alias else ''} · base currency {p.base_currency} · "
+    head = (f"{CONSOLIDATED_LABEL}: {', '.join(p.account_ids)}" if p.is_consolidated
+            else f"{p.account}{(' · ' + p.alias) if p.alias else ''}")
+    st.caption(f"{head} · base currency {p.base_currency} · "
                f"statements {p.period_start} → {p.period_end} · {len(p.statements)} file(s) merged")
     if snap.problem:
         st.error(snap.problem)

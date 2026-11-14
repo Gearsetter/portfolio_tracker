@@ -22,7 +22,8 @@ CLOSES = {"AAPL": 160.0, "SAP": 130.0}
 @dataclass
 class Truth:
     cash: dict[str, float] = field(default_factory=dict)
-    positions: dict[tuple[str, str], float] = field(default_factory=dict)
+    positions: dict[tuple[str, str], float] = field(default_factory=dict)    # sum of the transactions that were kept
+    holdings: dict[tuple[str, str], float] = field(default_factory=dict)     # what the statement's Open Positions show
     gross: dict[tuple[str, str], float] = field(default_factory=dict)        # sum(total + fee) per position
     deposits_eur: float = 0.0                                                # deposits + withdrawal + fee (no interest)
     n_stock_trades: int = 3
@@ -38,10 +39,17 @@ def _row(*cells) -> str:
 
 
 def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025, 12, 31),
-             only_before: date | None = None, only_from: date | None = None) -> tuple[bytes, Truth]:
+             only_before: date | None = None, only_from: date | None = None,
+             split: tuple[str, float, date] | None = None, open_positions: bool = True) -> tuple[bytes, Truth]:
     """Statement text + ground truth.  ``only_before`` / ``only_from`` keep just the transactions dated before /
-    from that day (to build overlapping or consecutive statements out of one ledger).  The returned truth
-    describes the transactions that were kept."""
+    from that day (to build overlapping or consecutive statements out of one ledger).  ``truth.cash`` / ``positions``
+    describe the transactions that were kept.
+
+    Like a real statement the Open Positions section shows what the account HOLDS at ``period_end`` - all trades up
+    to that day, whichever of them the file lists - and a stock split ``(symbol, ratio, day)`` multiplies the shares
+    (and divides the close price) from ``day`` on WITHOUT touching the trades, exactly the situation in which the
+    sum of the transactions no longer equals the share count.  The split also adds a "Corporate Actions" section.
+    ``open_positions=False`` leaves the section out (a custom statement)."""
     def keep(d: date) -> bool:
         return (only_before is None or d < only_before) and (only_from is None or d >= only_from)
 
@@ -126,14 +134,34 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
     add(_row("Mark-to-Market Performance Summary", "Data", "Forex", "USD", 0, t.cash["USD"], "--",
              f"{EUR_PER_USD_CLOSE:.4f}", 0, 0, 0, 0, 0, ""))
 
-    # ---- open positions ------------------------------------------------------------------------------------------
-    closes = CLOSES
-    add(_row("Open Positions", "Header", "DataDiscriminator", "Asset Category", "Currency", "Symbol", "Quantity", "Mult",
-             "Cost Price", "Cost Basis", "Close Price", "Value", "Unrealized P/L", "Code"))
-    for (sym, ccy), q in sorted(pos.items()):
-        if abs(q) > 1e-9:
+    # ---- open positions: what is held at the end of the period -----------------------------------------------------
+    held: dict[tuple[str, str], float] = {}
+    for sym, ccy, dt, qty, price, comm in stocks:
+        if dt.date() <= period_end:
+            held[(sym, ccy)] = held.get((sym, ccy), 0.0) + qty
+    closes = dict(CLOSES)
+    if split and split[2] <= period_end:
+        for key in held:
+            if key[0] == split[0]:
+                held[key] *= split[1]
+        closes[split[0]] = CLOSES[split[0]] / split[1]
+    held = {k: v for k, v in held.items() if abs(v) > 1e-9}
+    t.holdings = dict(held)
+    if open_positions:
+        add(_row("Open Positions", "Header", "DataDiscriminator", "Asset Category", "Currency", "Symbol", "Quantity",
+                 "Mult", "Cost Price", "Cost Basis", "Close Price", "Value", "Unrealized P/L", "Code"))
+        for (sym, ccy), q in sorted(held.items()):
             add(_row("Open Positions", "Data", "Summary", "Stocks", ccy, sym, q, 1, 100, 100 * q, closes[sym],
                      closes[sym] * q, 0, ""))
+    if split and split[2] <= period_end:
+        sym, ratio, day = split
+        before = sum(q for s_, c_, dt, q, _p, _c in stocks if s_ == sym and dt.date() <= day)
+        add(_row("Corporate Actions", "Header", "Asset Category", "Currency", "Report Date", "Date/Time", "Description",
+                 "Quantity", "Proceeds", "Value", "Realized P/L", "Code"))
+        add(_row("Corporate Actions", "Data", "Stocks", "USD", day.isoformat(), f"{day.isoformat()}, 20:25:00",
+                 f"{sym}(US0378331005) Split {ratio:g} for 1 ({sym}, APPLE INC, US0378331005)",
+                 before * (ratio - 1), 0, 0, 0, ""))
+        add(_row("Corporate Actions", "Total", "", "", "", "", "", "", 0, 0, 0, ""))
 
     # ---- trades --------------------------------------------------------------------------------------------------
     add(_row("Trades", "Header", "DataDiscriminator", "Asset Category", "Currency", "Symbol", "Date/Time", "Quantity",

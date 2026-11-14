@@ -15,7 +15,7 @@ from ibkr_tracker.excel import build_workbook, embed_values
 from ibkr_tracker.market import MarketDataService
 from ibkr_tracker.parsing import parse_statement
 from ibkr_tracker.portfolio import merge_statements
-from ibkr_tracker.reconcile import reconcile
+from ibkr_tracker.reconcile import SHARE_CHECK, reconcile
 from ibkr_tracker.storage import Store
 
 AS_OF = date(2025, 12, 31)
@@ -72,8 +72,7 @@ def test_metrics(data, md):
 def test_reconciliation_including_nav_is_clean(data, md):
     p, _ = data
     rows = reconcile(p, compute_metrics(p, md))
-    assert [r.check for r in rows] == ["Cash balance", "Open position (qty)", "Open position (qty)",
-                                       "Net asset value (USD)"]
+    assert [r.check for r in rows] == ["Cash balance", SHARE_CHECK, SHARE_CHECK, "Net asset value (USD)"]
     assert all(r.status in ("OK", "INFO") for r in rows), [(r.check, r.item, r.difference) for r in rows]
 
 
@@ -91,3 +90,26 @@ def test_workbook_recalculates_to_the_same_numbers(data, md, tmp_path):
     assert vals[f"M{lay.sum_base}"] == pytest.approx(vals[f"O{lay.sum_usd}"])    # USD summary == base summary
     assert vals[f"C{lay.p_first}"] == 1                                         # "USD.USD" column is 1
     assert sheet_values(path, "Checks")["B4"] == "all checks passed"
+
+
+def test_vuaa_cagr_by_hand(data, md):
+    """Every figure below is worked out on paper from the ledger of ``synth.make_usd_csv`` and a hand-made benchmark."""
+    from ibkr_tracker.market.data import BenchSeries
+    p, _ = data
+    closes = {date(2025, 2, 10): 100.0, date(2025, 3, 12): 110.0, date(2025, 8, 12): 125.0, date(2025, 12, 31): 140.0}
+    md.benchmark = BenchSeries("VUAA.L", "USD", list(closes), list(closes.values()), list(closes.values()), "test")
+    b = compute_metrics(p, md).benchmark
+    # purchases: MSFT +10 @ 400 = 4000, KO +20 @ 60 = 1200, MSFT -4 @ 450 = -1800 (sells are negative)
+    invested = 4000 + 1200 - 1800
+    units = 4000 / 100 + 1200 / 110 - 1800 / 125                      # 40 + 10.90909.. - 14.4 = 36.50909..
+    value = units * 140
+    assert (b.invested_usd, b.units, b.value_usd) == (pytest.approx(3400.0), pytest.approx(units), pytest.approx(value))
+    assert b.ret_vuaa == pytest.approx(value / invested) == pytest.approx(1.5033155, abs=1e-6)
+    # average age of the money: (4000 x 324 + 1200 x 294 - 1800 x 141) / 3400 days to 2025-12-31
+    days = (4000 * 324 + 1200 * 294 - 1800 * 141) / 3400.0
+    assert (date(2025, 12, 31) - date(2025, 2, 10)).days == 324 and (date(2025, 12, 31) - date(2025, 8, 12)).days == 141
+    assert b.years == pytest.approx(days / 365.0) == pytest.approx(1.1241, abs=1e-4)
+    assert b.cagr_vuaa == pytest.approx((value / invested) ** (365.0 / days) - 1) == pytest.approx(0.43716, abs=1e-4)
+    # stocks: MSFT 6 x 500 + KO 20 x 70 = 4400 USD on the same basis
+    assert b.cagr_stocks == pytest.approx((4400 / invested) ** (365.0 / days) - 1)
+    assert b.excess_usd == pytest.approx(4400 - value)

@@ -15,7 +15,9 @@ from helpers import compare_portfolio_sheet, error_cells, layout_for, sheet_valu
 from ibkr_tracker.calc import compute_metrics
 from ibkr_tracker.config import DEFAULT_SETTINGS
 from ibkr_tracker.excel import build_workbook, embed_values
+from ibkr_tracker.excel.layout import WORKBOOK_VERSION
 from ibkr_tracker.market import MarketDataService
+from ibkr_tracker.reconcile import SHARE_CHECK
 from ibkr_tracker.storage import Store
 
 SETTINGS = dict(DEFAULT_SETTINGS, price_source="statement", recalc_with_libreoffice=False)
@@ -165,7 +167,8 @@ def test_calculated_columns_are_formulas(ws, lay):
     for r in range(lay.f_first, lay.f_last + 1):
         assert is_f(f"D{r}")
     for r in range(lay.pos_first, lay.pos_last + 1):
-        assert all(is_f(f"{c}{r}") for c in "KLMNOP") and ws[f"Q{r}"].value is None      # CAGR column: empty by design
+        assert all(is_f(f"{c}{r}") for c in "LMNOPST") and ws[f"Q{r}"].value is None     # CAGR column: empty by design
+        assert not is_f(f"K{r}") and ws[f"K{r}"].font.color.rgb.endswith("0000FF")       # share count = statement value
     for r in range(lay.cash_first, lay.cash_last + 1):
         assert is_f(f"K{r}") and is_f(f"O{r}")
     assert all(is_f(f"{c}{lay.sum_usd}") for c in "OPQR")
@@ -176,7 +179,8 @@ def test_calculated_columns_are_formulas(ws, lay):
 def test_key_formulas_follow_the_specification(ws, lay):
     r = lay.t_first
     assert ws[f"E{r}"].value == f"=C{r}*D{r}" and ws[f"J{r}"].value == f"=E{r}+F{r}"
-    assert ws[f"L{r}"].value == f"=C{r}*K{r}" and ws[f"M{r}"].value == f"=E{r}/R{r}"
+    assert ws[f"L{r}"].value == f"=C{r}*K{r}*SUMIFS(Pos_Factor,Pos_Ticker,B{r},Pos_Ccy,G{r})"
+    assert ws[f"M{r}"].value == f"=E{r}/R{r}"
     assert ws[f"N{r}"].value == f"=J{r}/R{r}" and ws[f"O{r}"].value == f"=L{r}/R{r}"
     assert ws[f"P{r}"].value == f'=IF(N(S{r})>0,M{r}/S{r},"")'
     p = lay.p_first
@@ -190,6 +194,13 @@ def test_key_formulas_follow_the_specification(ws, lay):
     assert ws[f"Q{h}"].value == f'=IFERROR(N{h}^(1/R{s})-1,"")'
     pos = lay.pos_first
     assert ws[f"N{pos}"].value.startswith(f'=IF(K{pos}=0,"",IFERROR(M{pos}/SUMIFS(Trade_Gross,')
+    assert ws[f"S{pos}"].value == f"=SUMIFS(Trade_Qty,Trade_Ticker,$J{pos},Trade_Ccy,$R{pos})"
+    assert ws[f"T{pos}"].value == f"=IF(ABS(S{pos})<0.000001,1,K{pos}/S{pos})"
+    b = lay.bm_hdr
+    assert ws[f"J{b + 11}"].value == "VUAA CAGR (USD)"
+    assert ws[f"K{b + 11}"].value == f'=IFERROR(IF(K{b + 10}>0,K{b + 7}^(1/K{b + 10})-1,"n/a"),"n/a")'
+    assert ws[f"K{b + 10}"].value == (f'=IFERROR(SUMPRODUCT(Trade_USDTotal*(AsOfDate-INT(Trade_Date)))/K{b + 4}'
+                                      f'/DaysPerYear,"n/a")')
 
 
 def test_only_widely_supported_functions(wb):
@@ -220,6 +231,9 @@ def test_named_ranges(wb, lay):
     assert names["BaseCcy"] == "Prices!$B$5" and names["AsOfDate"] == "Prices!$B$6" and names["DaysPerYear"] == "Prices!$B$7"
     assert names["BenchPriceUSD"] == "Prices!$F$14"
     assert names["Px_Key"] == "Prices!$A$17:$A$22" and names["Px_Used"] == "Prices!$I$17:$I$22"
+    pf, pl = lay.pos_first, lay.pos_last
+    assert names["Pos_Ticker"] == f"Portfolio!$J${pf}:$J${pl}" and names["Pos_Ccy"] == f"Portfolio!$R${pf}:$R${pl}"
+    assert names["Pos_TxQty"] == f"Portfolio!$S${pf}:$S${pl}" and names["Pos_Factor"] == f"Portfolio!$T${pf}:$T${pl}"
     n_fx = 1 + sum(1 for r in range(2, wb["FX"].max_row + 1) if wb["FX"].cell(r, 1).value)
     assert names["FX_Dates"] == f"FX!$A$2:$A${n_fx}" and names["FX_Hdr"].startswith("FX!$B$1:$")
     assert wb["FX"]["A1"].value == "Date" and wb["FX"]["B1"].value == "USD" and wb["FX"]["C1"].value == "HUF"
@@ -247,7 +261,7 @@ def test_prices_sheet_layout_and_override_cells(wb):
 
 def test_state_sheet_describes_the_archive(wb, pf_csv):
     st = wb["_state"]
-    assert st["A1"].value == "layout" and st["B1"].value == "ibkr-portfolio-tracker/layout-1"
+    assert st["A1"].value == "layout" and st["B1"].value == WORKBOOK_VERSION == "ibkr-portfolio-tracker/layout-2"
     assert st["B2"].value == pf_csv.signature() and st["B3"].value == "U24013787"
     assert wb["Prices"]["B10"].value == pf_csv.signature()
 
@@ -309,7 +323,7 @@ def test_checks_sheet_agrees_with_the_statement(recalculated_offline, pf_csv):
     assert checks["B4"] == "all checks passed"
     rows = [r for r in range(6, 30) if f"A{r}" in checks]
     kinds = [checks[f"A{r}"] for r in rows]
-    assert kinds.count("Cash balance") == 2 and kinds.count("Open position (qty)") == 6 and len(rows) == 9
+    assert kinds.count("Cash balance") == 2 and kinds.count(SHARE_CHECK) == 6 and len(rows) == 9
     assert {checks[f"G{r}"] for r in rows} == {"OK"}
     cash_rows = {checks[f"B{r}"]: r for r in rows if checks[f"A{r}"] == "Cash balance"}
     assert checks[f"C{cash_rows['HUF']}"] == pytest.approx(10633.268914319) and checks[f"E{cash_rows['HUF']}"] == pytest.approx(0, abs=1e-6)

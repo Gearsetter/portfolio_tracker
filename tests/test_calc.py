@@ -172,6 +172,25 @@ def test_benchmark_simulation(online):
     assert b.excess_usd == pytest.approx(m.stocks_usd - b.value_usd)
 
 
+def test_vuaa_cagr_is_the_purchase_weighted_time_weighted_cagr(online):
+    md, m = online
+    b = m.benchmark
+    invested = sum(r.usd_total for r in m.trades)
+    years = sum(r.usd_total * (md.as_of - r.trade.dt.date()).days for r in m.trades) / invested / 365.0
+    assert b.years == pytest.approx(years) and 0 < b.years < 1
+    assert b.cagr_vuaa == pytest.approx((b.value_usd / invested) ** (1 / years) - 1)
+    assert b.cagr_stocks == pytest.approx((m.stocks_usd / invested) ** (1 / years) - 1)
+    # same years and same invested amount on both sides: the CAGR order is the order of the values
+    assert (b.cagr_stocks > b.cagr_vuaa) == (m.stocks_usd > b.value_usd) == (b.excess_usd > 0)
+
+
+def test_vuaa_cagr_needs_benchmark_prices(m):
+    b = m.benchmark
+    assert b.cagr_vuaa is None                                              # no benchmark prices offline ...
+    assert b.years and b.years > 0 and b.cagr_stocks is not None            # ... but the stocks side is still known
+    assert b.cagr_stocks == pytest.approx((m.stocks_usd / b.invested_usd) ** (1 / b.years) - 1)
+
+
 def test_live_prices_change_the_valuation_but_not_the_cost(pf_csv, offline_md, online, m):
     md, live = online
     assert md.as_of == TODAY and live.as_of == TODAY

@@ -82,6 +82,8 @@ def test_consecutive_statements_are_concatenated_chronologically():
     assert merged.cash_balances()["EUR"] == pytest.approx(full_truth.cash["EUR"])
     assert merged.cash_balances()["USD"] == pytest.approx(full_truth.cash["USD"])
     assert merged.warnings == []
+    assert merged.holdings == full_truth.holdings                  # h2 (the newest statement) still shows the positions
+    assert merged.holdings_ref.startswith("h2.csv")
 
 
 def test_gap_between_statements_is_reported():

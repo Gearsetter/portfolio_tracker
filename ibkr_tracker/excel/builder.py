@@ -22,8 +22,8 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from .. import __version__
 from ..market.data import MarketData
-from ..portfolio import Portfolio
-from ..reconcile import NAV_REL_TOL, QTY_TOL, cash_tolerance
+from ..portfolio import QTY_TOL, SRC_TRANSACTIONS, Portfolio
+from ..reconcile import NAV_REL_TOL, SHARE_CHECK, cash_tolerance
 from . import layout as L
 from . import overrides as OV
 from .layout import Layout
@@ -159,7 +159,7 @@ def build_workbook(portfolio: Portfolio, md: MarketData, settings: dict, generat
     write_state(wb, portfolio, md, settings)
 
     wb.calculation.fullCalcOnLoad = True
-    wb.properties.title = f"IBKR portfolio {portfolio.account}"
+    wb.properties.title = f"IBKR portfolio {portfolio.label}"
     wb.properties.creator = f"IBKR Portfolio Tracker {__version__}"
     wb.active = 0
     return wb
@@ -179,10 +179,21 @@ def _fx_columns(md: MarketData, base: str) -> list[str]:
 def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, lay: Layout, base: str,
                      positions: list[tuple[str, str]], currencies: list[str]) -> None:
     widths = dict(A=38, B=11, C=14, D=14, E=16, F=15, G=20, H=20, I=3, J=17, K=18, L=15, M=17, N=13, O=17,
-                  P=15, Q=12, R=17, S=17)
+                  P=15, Q=12, R=17, S=17, T=15)
+    if p.is_consolidated:
+        widths[L.ACCOUNT_COL] = 13
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
     T, E, D, P_, F_, S = L.TRADE_COLS, L.EXT_COLS, L.DIV_COLS, L.DEP_COLS, L.FXT_COLS, L.POS_COLS
+    ac = L.ACCOUNT_COL
+
+    def acct_header(row: int) -> None:                  # consolidated workbook: which account a record belongs to
+        if p.is_consolidated:
+            _put(ws, f"{ac}{row}", "Account", font=F_BOLD, fill=FILL_HELP, border=B_HDR, align="center")
+
+    def acct_cell(row: int, value: str) -> None:
+        if p.is_consolidated:
+            _put(ws, f"{ac}{row}", value, font=F_INPUT, fill=FILL_HELP, align="center")
 
     # ---- Section 1: stock transactions + Section 5 extensions ----------------------------------------------
     _header(ws, lay.t_hdr, [("A", "Name"), ("B", "Ticker"), ("C", "Quantity"), ("D", "Price"), ("E", "Total"),
@@ -190,11 +201,15 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
     _header(ws, lay.t_hdr, [("J", "Gross"), ("K", "Current Price"), ("L", "Current Total"), ("M", "USD Total"),
                             ("N", "USD Gross"), ("O", "USD Current Total"), ("P", "VUAA Quantity"),
                             ("R", "FX rate (per USD)"), ("S", "VUAA close (USD)")], helper={"R", "S"})
+    acct_header(lay.t_hdr)
     _comment(ws, f"A{lay.t_hdr}", "Section 1 - Stock transactions (chronological). Sells carry negative quantity "
              "and total. Fee is a POSITIVE cost (IBKR reports commissions as negative numbers).")
     _comment(ws, f"E{lay.t_hdr}", "Total = Quantity x Price (negative for sells).", 260, 50)
     _comment(ws, f"J{lay.t_hdr}", "Section 5 - extensions of the Section 1 rows.\nGross = Total + Fee (cash paid incl. "
              "commission; for sells the negative of the net proceeds).", 300, 80)
+    _comment(ws, f"L{lay.t_hdr}", "Current Total = Quantity x Current Price x share factor (Section 6, column T). "
+             "The factor is 1 unless a stock split / transfer makes the statement's share count differ from the sum "
+             "of the transactions; it expresses the transaction in today's shares.", 340, 100)
     _comment(ws, f"M{lay.t_hdr}", "Total converted to USD with the closing USD rate on the transaction date "
              "(as-of lookup in the FX sheet; unchanged for USD). Column O uses the SAME purchase-date rate by "
              "design, so it isolates the price performance from currency moves.", 340, 110)
@@ -212,7 +227,8 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         _put(ws, f"H{r}", t.dt, FMT_DT, F_INPUT)
         _put(ws, f"J{r}", f"=E{r}+F{r}", FMT_MONEY)
         _put(ws, f"K{r}", f'=INDEX(Px_Used,MATCH(B{r}&"|"&G{r},Px_Key,0))', FMT_PRICE, F_LINK)
-        _put(ws, f"L{r}", f"=C{r}*K{r}", FMT_MONEY)
+        _put(ws, f"L{r}", f"=C{r}*K{r}*SUMIFS(Pos_Factor,Pos_Ticker,B{r},Pos_Ccy,G{r})", FMT_MONEY)
+        acct_cell(r, t.account)
         _put(ws, f"M{r}", f"=E{r}/R{r}", FMT_MONEY)
         _put(ws, f"N{r}", f"=J{r}/R{r}", FMT_MONEY)
         _put(ws, f"O{r}", f"=L{r}/R{r}", FMT_MONEY)
@@ -224,6 +240,7 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
     # ---- Section 2: dividends -------------------------------------------------------------------------------
     _header(ws, lay.d_hdr, [("A", "Name"), ("B", "Ticker"), ("C", "Quantity"), ("D", "Dividend"), ("E", "Total"),
                             ("F", "Withholding Tax"), ("G", "Currency"), ("H", "Date")])
+    acct_header(lay.d_hdr)
     _comment(ws, f"A{lay.d_hdr}", "Section 2 - Dividend payouts (chronological). Dividend, withholding tax and fees "
              "of the same payment are synchronised on one row.", 320, 80)
     _comment(ws, f"D{lay.d_hdr}", "Dividend per share (from the IBKR description). Quantity = shares that earned it "
@@ -242,10 +259,12 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         _put(ws, f"F{r}", d.tax_fee, FMT_MONEY, F_INPUT)
         _put(ws, f"G{r}", d.currency, font=F_INPUT, align="center")
         _put(ws, f"H{r}", _dt(d.dt), FMT_DATE, F_INPUT)
+        acct_cell(r, d.account)
 
     # ---- Section 3: deposits & withdrawals -----------------------------------------------------------------
     _header(ws, lay.p_hdr, [("A", "Description"), ("B", "Amount"), ("C", f"USD.{base}"), ("D", "USD Amount"),
                             ("E", "Date"), ("F", "Currency"), ("G", f"Amount ({base})")], helper={"F", "G"})
+    acct_header(lay.p_hdr)
     _comment(ws, f"A{lay.p_hdr}", "Section 3 - Deposits, withdrawals, monthly fees (and interest). Hover over a "
              "description cell for the original IBKR text. Columns F-G are helper columns.", 330, 90)
     _comment(ws, f"C{lay.p_hdr}", f"Closing {base} per 1 USD on that date (quote 'USD.{base}', e.g. ~320 for HUF).",
@@ -265,11 +284,13 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         _put(ws, f"E{r}", _dt(c.dt), FMT_DATE, F_INPUT)
         _put(ws, f"F{r}", c.currency, font=F_INPUT, fill=FILL_HELP, align="center")
         _put(ws, f"G{r}", f"=IF(F{r}=BaseCcy,B{r},D{r}*C{r})", FMT_MONEY, F_NORMAL, fill=FILL_HELP)
+        acct_cell(r, c.account)
 
     # ---- Section 4: forex ---------------------------------------------------------------------------------
     _header(ws, lay.f_hdr, [("A", "Currency Bought"), ("B", "Quantity"), ("C", "Price"), ("D", "Total"),
                             ("E", "Fee"), ("F", "Currency Paid"), ("G", "Date"), ("H", "Fee Currency")],
             helper={"H"})
+    acct_header(lay.f_hdr)
     _comment(ws, f"A{lay.f_hdr}", "Section 4 - Currency transactions, e.g. USD.HUF: USD (Currency Bought) is bought "
              "with HUF (Currency Paid). Negative quantity = the currency was sold (end-of-day sweeps). Fee is a "
              "positive cost in the 'Fee Currency' (IBKR charges forex commission in the base currency).", 360, 120)
@@ -283,22 +304,37 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         _put(ws, f"F{r}", f.paid, font=F_INPUT, align="center")
         _put(ws, f"G{r}", f.dt, FMT_DT, F_INPUT)
         _put(ws, f"H{r}", f.fee_currency, font=F_INPUT, fill=FILL_HELP, align="center")
+        acct_cell(r, f.account)
 
     # ---- Section 6: positions ------------------------------------------------------------------------------
     _header(ws, lay.pos_hdr, [("J", "Ticker"), ("K", "Quantity"), ("L", "Current Price"), ("M", "Value"),
                               ("N", "Return"), ("O", "USD Value"), ("P", "USD Return"), ("Q", "CAGR"),
-                              ("R", "Currency")], helper={"R"})
-    _comment(ws, f"J{lay.pos_hdr}", "Section 6 - Portfolio positions (one row per ticker ever bought). "
+                              ("R", "Currency"), ("S", "Transactions (sum)"), ("T", "Share factor")],
+            helper={"R", "S", "T"})
+    _comment(ws, f"J{lay.pos_hdr}", "Section 6 - Portfolio positions (one row per ticker ever bought or held). "
              "Value is in the stock's own currency; USD Value uses the latest USD rate.", 330, 80)
+    _comment(ws, f"K{lay.pos_hdr}", "Shares held = the 'Open Positions' section of the latest Activity Statement "
+             "(blue = taken from it). It is the source of truth, so stock splits and other corporate actions are "
+             "reflected; the corporate-action section and the sum of the transactions are not used. "
+             f"[{p.holdings_source or 'transactions'}: {p.holdings_ref or 'n/a'}]", 360, 140)
+    _comment(ws, f"S{lay.pos_hdr}", "Sum of the signed quantities of the Section 1 transactions - for comparison "
+             "only (see the Checks sheet).", 280, 60)
+    _comment(ws, f"T{lay.pos_hdr}", "Statement shares / sum of the transactions (1 when they agree, e.g. 10 after a "
+             "10:1 split). Section 5 'Current Total' multiplies each transaction by it.", 300, 80)
     _comment(ws, f"N{lay.pos_hdr}", "Return = Value / Gross (value as a multiple of the cash invested incl. fees; "
              "1.10x = +10%). Blank for closed positions.", 300, 70)
     _comment(ws, f"Q{lay.pos_hdr}", "Left empty by design (CAGR is reported for the whole portfolio in "
              "Sections 8 and 9).", 260, 50)
+    held = p.net_quantities()
+    from_statement = p.holdings_source not in ("", SRC_TRANSACTIONS)
     for i, (ticker, ccy) in enumerate(positions):
         r = lay.pos_first + i
         crit = f"Trade_Ticker,$J{r},Trade_Ccy,$R{r}"
         _put(ws, f"J{r}", ticker, font=F_INPUT)
-        _put(ws, f"K{r}", f"=SUMIFS(Trade_Qty,{crit})", "General")
+        if from_statement:
+            _put(ws, f"K{r}", held.get((ticker, ccy), 0.0), "General", F_INPUT)
+        else:                                                  # no Open Positions anywhere: sum of the transactions
+            _put(ws, f"K{r}", f"=SUMIFS(Trade_Qty,{crit})", "General")
         _put(ws, f"L{r}", f'=INDEX(Px_Used,MATCH($J{r}&"|"&$R{r},Px_Key,0))', FMT_PRICE, F_LINK)
         _put(ws, f"M{r}", f"=K{r}*L{r}", FMT_MONEY)
         _put(ws, f"N{r}", f'=IF(K{r}=0,"",IFERROR(M{r}/SUMIFS(Trade_Gross,{crit}),""))', FMT_RATIO)
@@ -306,6 +342,8 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         _put(ws, f"P{r}", f'=IF(K{r}=0,"",IFERROR(O{r}/SUMIFS(Trade_USDGross,{crit}),""))', FMT_RATIO)
         _put(ws, f"Q{r}", None)
         _put(ws, f"R{r}", ccy, font=F_INPUT, fill=FILL_HELP, align="center")
+        _put(ws, f"S{r}", f"=SUMIFS(Trade_Qty,{crit})", "General", F_NORMAL, FILL_HELP)
+        _put(ws, f"T{r}", f"=IF(ABS(S{r})<{QTY_TOL:.6f},1,K{r}/S{r})", "0.0000", F_NORMAL, FILL_HELP)
 
     # ---- Section 7: cash balances --------------------------------------------------------------------------
     active = set(p.active_currencies())
@@ -373,10 +411,20 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         ("VUAA return", f'=IF(K{b + 1}>0,K{b + 3}/K{b + 4},"n/a")', FMT_RATIO),
         ("Stocks return (latest FX)", f'=IFERROR(K{b + 6}/K{b + 4},"n/a")', FMT_RATIO),
         ("Stocks minus VUAA (USD)", f'=IF(K{b + 1}>0,K{b + 6}-K{b + 3},"n/a")', FMT_MONEY),
+        ("Avg. years since the purchases",
+         f'=IFERROR(SUMPRODUCT(Trade_USDTotal*(AsOfDate-INT(Trade_Date)))/K{b + 4}/DaysPerYear,"n/a")', FMT_YEARS),
+        ("VUAA CAGR (USD)", f'=IFERROR(IF(K{b + 10}>0,K{b + 7}^(1/K{b + 10})-1,"n/a"),"n/a")', FMT_PCT),
+        ("Stocks CAGR (USD, same basis)", f'=IFERROR(IF(K{b + 10}>0,K{b + 8}^(1/K{b + 10})-1,"n/a"),"n/a")', FMT_PCT),
     ]
     for i, (label, formula, fmt) in enumerate(rows, start=1):
         _put(ws, f"J{b + i}", label)
         _put(ws, f"K{b + i}", formula, fmt, F_LINK if "Bench" in formula else F_NORMAL)
+    _comment(ws, f"J{b + 10}", "Weighted average time from each stock transaction (weight = its USD Total, sells "
+             "negative) to the valuation date, in years (Prices!B7 days per year).", 320, 80)
+    _comment(ws, f"J{b + 11}", "Time-weighted CAGR of the VUAA simulation in USD: (VUAA value / invested)^(1 / avg. "
+             "years since the purchases) - 1. Every stock transaction is replayed into the benchmark ETF at that "
+             "day's close (Section 5, column P). 'Stocks CAGR' below uses the same years and invested amount, so "
+             "the two lines are directly comparable.", 360, 130)
     ws.column_dimensions["J"].width = 36
     _print_setup(ws)
 
@@ -519,11 +567,13 @@ def _write_checks(ws: Worksheet, p: Portfolio, lay: Layout, positions: list[tupl
                   currencies: list[str], base: str) -> None:
     for col, w in dict(A=24, B=14, C=20, D=20, E=16, F=14, G=12).items():
         ws.column_dimensions[col].width = w
-    latest = p.latest
+    refs = p.latest_statements()
     _put(ws, "A1", "Reconciliation with the IBKR statement", font=F_TITLE, border=None)
-    src = f"{latest.filename} (period end {latest.period_end})" if latest else "n/a"
-    _put(ws, "A2", f"Reference: Cash Report / Open Positions / NAV of {src}. Differences mean missing statements, "
-         f"unsupported transaction types, or (NAV) prices that differ from the statement date.", font=F_NOTE, border=None)
+    src = "; ".join(f"{s.filename} (period end {s.period_end})" for s in refs) or "n/a"
+    _put(ws, "A2", f"Reference: Cash Report / NAV of {src}. Differences mean missing statements, unsupported "
+         f"transaction types, or (NAV) prices that differ from the statement date. The share counts are TAKEN from "
+         f"the Open Positions section; the 'Share count' rows only show where the transaction sum differs (INFO: "
+         f"stock split, transfer, earlier history).", font=F_NOTE, border=None)
     _put(ws, "A3", "Cash tolerance (abs.)", border=B_CELL)
     _put(ws, "B3", cash_tolerance(p), "0.0000", F_INPUT, FILL_IN)
     _comment(ws, "B3", "0.01 for full-precision (CSV) data; +0.0051 per amount that IBKR's HTML rounded to cents "
@@ -534,7 +584,7 @@ def _write_checks(ws: Worksheet, p: Portfolio, lay: Layout, positions: list[tupl
                     ("E", "Difference"), ("F", "Tolerance"), ("G", "Status")])
     r = 6
     first = r
-    ending = {l.currency: l.total for l in (latest.cash_report if latest else []) if l.line == "Ending Cash"}
+    ending = p.reference_cash()
     for i, ccy in enumerate(currencies):
         if ccy in ending:
             _put(ws, f"A{r}", "Cash balance")
@@ -545,22 +595,27 @@ def _write_checks(ws: Worksheet, p: Portfolio, lay: Layout, positions: list[tupl
             _put(ws, f"F{r}", "=$B$3", "0.0000")
             _put(ws, f"G{r}", f'=IF(ABS(E{r})<=F{r},"OK","CHECK")', align="center")
             r += 1
-    held = {(op.ticker, op.currency): op.quantity for op in (latest.open_positions if latest else [])}
-    for i, (ticker, ccy) in enumerate(positions):
-        ibkr_qty = held.get((ticker, ccy), 0.0)
-        _put(ws, f"A{r}", "Open position (qty)")
-        _put(ws, f"B{r}", ticker, align="center")
-        _put(ws, f"C{r}", ibkr_qty, "General", F_INPUT)
-        _put(ws, f"D{r}", f"={L.PORTFOLIO}!K{lay.pos_first + i}", "General", F_LINK)
-        _put(ws, f"E{r}", f"=D{r}-C{r}", "0.000000")
-        _put(ws, f"F{r}", QTY_TOL, "0.000000", F_INPUT)
-        _put(ws, f"G{r}", f'=IF(ABS(E{r})<=F{r},"OK","CHECK")', align="center")
-        r += 1
+    held = p.net_quantities()
+    if p.holdings_source not in ("", SRC_TRANSACTIONS):           # nothing to compare when the counts ARE the sums
+        for i, (ticker, ccy) in enumerate(positions):
+            _put(ws, f"A{r}", SHARE_CHECK)
+            _put(ws, f"B{r}", ticker, align="center")
+            _put(ws, f"C{r}", held.get((ticker, ccy), 0.0), "General", F_INPUT)
+            _put(ws, f"D{r}", f"={L.PORTFOLIO}!S{lay.pos_first + i}", "General", F_LINK)
+            _put(ws, f"E{r}", f"=D{r}-C{r}", "0.000000")
+            _put(ws, f"F{r}", QTY_TOL, "0.000000", F_INPUT)
+            _put(ws, f"G{r}", f'=IF(ABS(E{r})<=F{r},"OK","INFO")', align="center")
+            if i == 0:
+                _comment(ws, f"G{r}", "INFO (not an error): the statement's Open Positions are the source of truth "
+                         "for the share count. A difference to the transaction sum means a stock split / corporate "
+                         "action, a transfer, or history from before the first imported statement.", 320, 100)
+            r += 1
     last = r - 1
-    if latest and "total" in latest.nav:
+    nav = p.reference_nav()
+    if nav is not None:
         _put(ws, f"A{r}", f"Net asset value ({base})")
         _put(ws, f"B{r}", base, align="center")
-        _put(ws, f"C{r}", latest.nav["total"], FMT_MONEY, F_INPUT)
+        _put(ws, f"C{r}", nav, FMT_MONEY, F_INPUT)
         _put(ws, f"D{r}", f"={L.PORTFOLIO}!M{lay.sum_base}", FMT_MONEY, F_LINK)
         _put(ws, f"E{r}", f"=D{r}-C{r}", FMT_MONEY)
         _put(ws, f"F{r}", f"=$E$3*C{r}", FMT_MONEY)
@@ -588,7 +643,8 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
     ws.column_dimensions["B"].width = 110
     _put(ws, "A1", "IBKR Portfolio Tracker - about this workbook", font=F_TITLE, border=None)
     info = [
-        ("Account", f"{p.account} {('(' + p.alias + ')') if p.alias else ''}  -  base currency {base}"),
+        ("Account", (f"{p.label}: {', '.join(p.account_ids)}" if p.is_consolidated else
+                     f"{p.account} {('(' + p.alias + ')') if p.alias else ''}") + f"  -  base currency {base}"),
         ("Generated", f"{generated_at:%Y-%m-%d %H:%M} by IBKR Portfolio Tracker {__version__}"),
         ("Statement coverage", f"{p.period_start} to {p.period_end}"),
         ("Market data", md.mode),
@@ -605,7 +661,7 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
     index = [
         ("1  Stock transactions", f"A{lay.t_hdr}"), ("2  Dividend payouts", f"A{lay.d_hdr}"),
         ("3  Deposits & withdrawals", f"A{lay.p_hdr}"), ("4  Currency / forex transactions", f"A{lay.f_hdr}"),
-        ("5  Transaction extensions (J:P)", f"J{lay.t_hdr}"), ("6  Portfolio positions", f"J{lay.pos_hdr}"),
+        ("5  Transaction extensions (J:P)", f"J{lay.t_hdr}"), ("6  Portfolio positions (J:T)", f"J{lay.pos_hdr}"),
         ("7  Cash balances", f"J{lay.cash_first}"), ("8  Summary (USD)", f"J{lay.sum_usd}"),
         (f"9  Summary ({base})", f"J{lay.sum_base}"), ("10 Benchmark comparison (VUAA)", f"J{lay.bm_hdr}"),
     ]
@@ -637,6 +693,12 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
         ("Refreshing", "Use the app's Refresh Prices button: it rewrites only the Prices/FX/Benchmark sheets in place, "
                        "all formulas stay untouched and recalculate. You can also type overrides on the Prices sheet."),
         ("Fee currency", "Forex commission is charged in the account's base currency (Section 4, column H)."),
+        ("Share counts", "Quantities in Section 6 come from the 'Open Positions' section of the latest statement "
+                         "(blue cells), NOT from the corporate-action section or the transaction sum, so stock splits "
+                         "are reflected. Column S = sum of the transactions, column T = factor that converts a "
+                         "transaction's quantity into today's shares (used by 'Current Total')."),
+        ("VUAA CAGR", "Section 10: every stock transaction replayed into the benchmark ETF; CAGR = (VUAA value / "
+                      "invested)^(1/average years since the purchases) - 1, in USD. 'Stocks CAGR' uses the same basis."),
     ]
     for k, v in notes:
         _put(ws, f"A{r}", k, font=F_BOLD, border=None)
@@ -652,6 +714,15 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
             _put(ws, f"B{r}", w, font=F_WARN, border=None)
             ws[f"B{r}"].alignment = Alignment(wrap_text=True, vertical="top")
             ws.row_dimensions[r].height = 30 if len(w) > 110 else 16
+            r += 1
+    if p.notes:
+        r += 1
+        _put(ws, f"A{r}", "Notes", font=F_BOLD, border=None)
+        r += 1
+        for w in p.notes:
+            _put(ws, f"B{r}", w, border=None)
+            ws[f"B{r}"].alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[r].height = 16 * (1 + len(w) // 110)
             r += 1
     r += 1
     _put(ws, f"A{r}", "Statements included", font=F_BOLD, border=None)
@@ -675,6 +746,8 @@ def _define_names(wb: Workbook, lay: Layout, positions: list[tuple[str, str]], c
     for key, nm in dict(gross="Gross", cur_price="CurPrice", cur_total="CurTotal", usd_total="USDTotal",
                         usd_gross="USDGross", usd_cur="USDCur", vuaa="VUAAQty").items():
         _name(wb, "Trade_" + nm, rng(lay.t_first, lay.t_last, L.EXT_COLS[key]))
+    for key, nm in dict(ticker="Ticker", ccy="Ccy", tx_qty="TxQty", factor="Factor").items():
+        _name(wb, "Pos_" + nm, rng(lay.pos_first, lay.pos_last, L.POS_COLS[key]))
     for key, nm in dict(name="Name", ticker="Ticker", qty="Qty", per_share="PerShare", total="Total", tax="Tax",
                         ccy="Ccy", date="Date").items():
         _name(wb, "Div_" + nm, rng(lay.d_first, lay.d_last, L.DIV_COLS[key]))

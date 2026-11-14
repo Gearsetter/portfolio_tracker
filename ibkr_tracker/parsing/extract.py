@@ -14,6 +14,9 @@ HANDLED_SECTIONS = {
     "Trades", "Deposits & Withdrawals", "Fees", "Dividends", "Withholding Tax", "Interest",
     "Change in Dividend Accruals", "Financial Instrument Information", "Open Positions", "Cash Report",
     "Net Asset Value", "Mark-to-Market Performance Summary",
+    # splits, mergers, spin-offs ...: deliberately NOT used - the Open Positions section is the source of truth for
+    # the share counts (see ibkr_tracker.portfolio); only a note is written
+    "Corporate Actions",
 }
 # purely informational report sections: they never change cash or positions
 INFORMATIONAL_SECTIONS = {
@@ -186,7 +189,8 @@ def build_statement(raw: RawStatement, filename: str, sha256: str) -> ParsedStat
             gross_amount=num0(pick(r, "Gross Amount")), net_amount=num0(pick(r, "Net Amount")),
             code=pick(r, "Code")))
 
-    # ---- snapshots used for reconciliation / offline pricing -------------------------------------------
+    # ---- Open Positions: the source of truth for the share counts (also: reconciliation, offline pricing) --------
+    ps.open_positions_section = bool(sec.get("Open Positions"))
     for r in sec.get("Open Positions", []):
         if pick(r, "DataDiscriminator", default="Summary").strip().lower() != "summary":
             continue
@@ -220,6 +224,13 @@ def build_statement(raw: RawStatement, filename: str, sha256: str) -> ParsedStat
             sym = pick(r, "Symbol").strip().upper()
             if cur and sym:
                 ps.fx_closes[sym] = cur
+
+    n_actions = sum(1 for r in sec.get("Corporate Actions", []) if not _is_total_row(*r.values()))
+    if n_actions:
+        ps.notes.append(
+            f"{n_actions} corporate-action row(s) (stock split, merger, spin-off ...) are not used: the share counts "
+            f"come from the Open Positions section. Cash paid by a corporate action (e.g. cash in lieu of fractional "
+            f"shares) is not part of the computed cash balance - the cash check on the Reconciliation tab shows it.")
 
     # ---- names, unsupported sections ---------------------------------------------------------------------
     for name, rows in sec.items():

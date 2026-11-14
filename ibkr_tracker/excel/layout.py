@@ -5,7 +5,9 @@ Main sheet ``Portfolio``::
     A..H   Sections 1-4 stacked vertically, 5 empty rows between sections
     J..P   Section 5 (extension of the Section 1 rows)
     J..Q   Sections 6-9 (+ benchmark block) stacked vertically below Section 5, 5 empty rows after it
-    R..S   helper columns (FX rate / benchmark close per transaction, currency per position, years)
+    R..T   helper columns (FX rate / benchmark close per transaction; currency, sum of the transactions and share
+           factor per position; years)
+    I      "Account" of every record in Sections 1-4 - only in the consolidated (all accounts) workbook
 """
 from __future__ import annotations
 
@@ -27,7 +29,9 @@ EXT_COLS = dict(gross="J", cur_price="K", cur_total="L", usd_total="M", usd_gros
 DIV_COLS = dict(name="A", ticker="B", qty="C", per_share="D", total="E", tax="F", ccy="G", date="H")
 DEP_COLS = dict(desc="A", amount="B", rate="C", usd="D", date="E", ccy="F", base="G")
 FXT_COLS = dict(bought="A", qty="B", price="C", total="D", fee="E", paid="F", date="G", fee_ccy="H")
-POS_COLS = dict(ticker="J", qty="K", price="L", value="M", ret="N", usd_value="O", usd_ret="P", cagr="Q", ccy="R")
+POS_COLS = dict(ticker="J", qty="K", price="L", value="M", ret="N", usd_value="O", usd_ret="P", cagr="Q", ccy="R",
+                tx_qty="S", factor="T")
+ACCOUNT_COL = "I"                      # consolidated workbook only: which account a Section 1-4 record belongs to
 
 # --- Prices sheet geometry ------------------------------------------------------------------------------
 PX_SETTINGS = dict(base=5, asof=6, days=7, mode=8, refreshed=9, fingerprint=10, bench_symbol=11)
@@ -38,7 +42,7 @@ PX_FX_COLS = dict(ccy="K", last="L", day="M", source="N", override="O", used="P"
 PX_BENCH_COLS = dict(symbol="A", last="B", day="C", source="D", override="E", used="F")
 
 STATE = "_state"                               # hidden sheet: layout version, archive signature, override snapshot
-WORKBOOK_VERSION = "ibkr-portfolio-tracker/layout-1"   # bump whenever the cell geometry / formulas change
+WORKBOOK_VERSION = "ibkr-portfolio-tracker/layout-2"   # bump whenever the cell geometry / formulas change
 
 
 @dataclass

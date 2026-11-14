@@ -32,6 +32,7 @@ class StockTrade:
     asset_class: str = "Stocks"
     codes: str = ""
     precision: str = "full"  # "full" (CSV) or "rounded" (HTML shows 2 decimals for amounts)
+    account: str = ""        # filled in when the statements are merged (the consolidated view needs it)
 
 
 @dataclass
@@ -47,6 +48,7 @@ class FxTrade:
     dt: datetime
     codes: str = ""
     precision: str = "full"
+    account: str = ""
 
 
 @dataclass
@@ -58,6 +60,7 @@ class CashFlow:
     dt: datetime
     description: str = ""
     precision: str = "full"
+    account: str = ""
 
 
 @dataclass
@@ -100,6 +103,7 @@ class DividendEvent:
     currency: str
     dt: date
     quantity_source: str = ""   # accrual | position | rate | none
+    account: str = ""
 
 
 @dataclass
@@ -158,6 +162,18 @@ class ParsedStatement:
     fx_closes: dict[str, float] = field(default_factory=dict)    # ccy -> base currency per 1 unit at period end
     warnings: list[str] = field(default_factory=list)
     unsupported: dict[str, int] = field(default_factory=dict)    # section/asset class -> ignored rows
+    notes: list[str] = field(default_factory=list)               # informational (not a problem)
+    # True when the statement contains an "Open Positions" section (even one without stocks).  None = archived
+    # before this flag existed: then "has stock rows" is the best available answer (see ``has_open_positions``).
+    open_positions_section: Optional[bool] = None
+
+    @property
+    def has_open_positions(self) -> bool:
+        """Does the statement tell us what is held?  (Its Open Positions section is the source of truth for the
+        share counts - see :mod:`ibkr_tracker.portfolio`.)"""
+        if self.open_positions_section is not None:
+            return self.open_positions_section
+        return bool(self.open_positions)
 
 
 @dataclass

@@ -1,21 +1,25 @@
 """Reconciliation of the workbook figures with the reference numbers printed in the newest IBKR statement.
 
 The *Checks* sheet of the workbook implements the same rules with formulas; the tests assert that both agree.
+
+The share counts are not reconciled *against* the statement - they are taken from it (Open Positions of the latest
+statement).  The "Share count" rows instead show where the sum of the transactions disagrees with the statement (a stock
+split, a transfer, history before the first imported statement): that is information (``INFO``), not an error.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from .calc import Metrics
-from .portfolio import Portfolio
+from .portfolio import QTY_TOL, SRC_TRANSACTIONS, Portfolio
 
 NAV_REL_TOL = 0.005          # holdings are valued at the latest prices, IBKR's NAV at the statement date
-QTY_TOL = 1e-6
+SHARE_CHECK = "Share count: statement vs transactions"
 
 
 @dataclass
 class CheckRow:
-    check: str               # Cash balance | Open position (qty) | Net asset value
+    check: str               # Cash balance | Share count: statement vs transactions | Net asset value
     item: str
     ibkr: float
     workbook: float
@@ -25,31 +29,31 @@ class CheckRow:
 
 
 def cash_tolerance(p: Portfolio) -> float:
-    """0.01 for full-precision data, plus 0.0051 for every amount IBKR's HTML rendering rounded to cents."""
+    """0.01 (per account) for full-precision data, plus 0.0051 for every amount IBKR's HTML rendering rounded to
+    cents."""
     n_rounded = sum(1 for x in [*p.trades, *p.fx_trades, *p.cash_flows] if x.precision != "full")
-    return round(0.01 + 0.0051 * n_rounded, 4)
+    return round(0.01 * max(1, len(p.account_ids)) + 0.0051 * n_rounded, 4)
 
 
 def reconcile(p: Portfolio, m: Metrics) -> list[CheckRow]:
-    latest = p.latest
+    refs = p.latest_statements()
     rows: list[CheckRow] = []
-    if latest is None:
+    if not refs:
         return rows
     tol = cash_tolerance(p)
-    ending = {l.currency: l.total for l in latest.cash_report if l.line == "Ending Cash"}
+    ending = p.reference_cash()                    # summed over the accounts for a consolidated portfolio
     for c in m.cash:
         if c.currency in ending:
             diff = c.balance - ending[c.currency]
             rows.append(CheckRow("Cash balance", c.currency, ending[c.currency], c.balance, diff, tol,
                                  "OK" if abs(diff) <= tol else "CHECK"))
-    held = {(op.ticker, op.currency): op.quantity for op in latest.open_positions}
-    for pos in m.positions:
-        ibkr_qty = held.get((pos.ticker, pos.currency), 0.0)
-        diff = pos.quantity - ibkr_qty
-        rows.append(CheckRow("Open position (qty)", pos.ticker, ibkr_qty, pos.quantity, diff, QTY_TOL,
-                             "OK" if abs(diff) <= QTY_TOL else "CHECK"))
-    if "total" in latest.nav:
-        nav = latest.nav["total"]
+    if p.holdings_source and p.holdings_source != SRC_TRANSACTIONS:
+        for pos in m.positions:
+            diff = pos.tx_quantity - pos.quantity
+            rows.append(CheckRow(SHARE_CHECK, pos.ticker, pos.quantity, pos.tx_quantity, diff, QTY_TOL,
+                                 "OK" if abs(diff) <= QTY_TOL else "INFO"))
+    nav = p.reference_nav()
+    if nav is not None:
         diff = m.base_total - nav
         tol_nav = NAV_REL_TOL * nav
         rows.append(CheckRow(f"Net asset value ({m.base_currency})", m.base_currency, nav, m.base_total, diff, tol_nav,

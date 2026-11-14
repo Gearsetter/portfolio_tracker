@@ -9,6 +9,7 @@ Typical flow::
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -22,7 +23,7 @@ from .market import MarketData, MarketDataService, RefreshReport
 from .market.providers import PriceProvider
 from .models import StatementInfo
 from .parsing import parse_statement
-from .portfolio import Portfolio, merge_statements
+from .portfolio import CONSOLIDATED, Portfolio, consolidate, merge_statements
 from .reconcile import CheckRow, reconcile
 from .storage import Store
 
@@ -38,14 +39,34 @@ class ImportResult:
 
 
 @dataclass
+class AccountSummary:
+    """One line of the per-account breakdown of the consolidated view (valued with the consolidated market data)."""
+    account: str
+    alias: str
+    base_currency: str
+    period_end: Optional[date]
+    stocks_usd: float
+    cash_usd: float
+    usd_total: float
+    usd_deposits: float
+    usd_return: Optional[float]
+    usd_cagr: Optional[float]
+    base_total: float                    # in the account's OWN base currency
+    n_trades: int
+    share: Optional[float] = None        # of the consolidated total value
+
+
+@dataclass
 class Snapshot:
-    """Everything the dashboard shows for one account at one moment."""
+    """Everything the dashboard shows for one account (or the consolidated view) at one moment."""
     portfolio: Portfolio
     settings: dict
     md: MarketData
     metrics: Optional[Metrics]           # None when the numbers cannot be computed (see ``problem``)
     checks: list[CheckRow]
     problem: str = ""
+    accounts: list[AccountSummary] = field(default_factory=list)            # consolidated view: breakdown
+    account_checks: dict[str, list[CheckRow]] = field(default_factory=dict)   # consolidated view: per-account checks
 
 
 @dataclass
@@ -96,7 +117,7 @@ class Tracker:
         return [self.import_statement(name, data) for name, data in files]
 
     def statements(self, account: Optional[str] = None) -> list[StatementInfo]:
-        return self.store.list_statements(account)
+        return self.store.list_statements(None if account in (None, "", CONSOLIDATED) else account)
 
     def delete_statement(self, statement_id: int) -> None:
         self.store.delete_statement(statement_id)
@@ -104,24 +125,42 @@ class Tracker:
     def accounts(self) -> list[tuple[str, str, Optional[date]]]:
         return self.store.accounts()
 
+    def account_choices(self) -> list[str]:
+        """What the GUI offers: the consolidated view first, then every account (empty without statements)."""
+        accounts = [a for a, _, _ in self.accounts()]
+        return [CONSOLIDATED, *accounts] if accounts else []
+
     def default_account(self) -> Optional[str]:
         accounts = [a for a, _, _ in self.accounts()]
         if not accounts:
             return None
         last = self.settings().get("last_account")
-        return last if last in accounts else accounts[0]
+        return last if (last in accounts or last == CONSOLIDATED) else accounts[0]
 
-    def portfolio(self, account: str) -> Optional[Portfolio]:
+    def portfolio(self, account: str, settings: Optional[dict] = None) -> Optional[Portfolio]:
+        """Merged portfolio of one account - or, for ``CONSOLIDATED``, of all accounts as one unified portfolio."""
+        if account == CONSOLIDATED:
+            return self.consolidated_portfolio(settings)
         statements = self.store.load_statements(account)
         return merge_statements(statements, account) if statements else None
+
+    def consolidated_portfolio(self, settings: Optional[dict] = None) -> Optional[Portfolio]:
+        by_account: dict[str, list] = defaultdict(list)
+        for s in self.store.load_statements():
+            by_account[s.account].append(s)
+        if not by_account:
+            return None
+        members = [merge_statements(sts, acc) for acc, sts in sorted(by_account.items())]
+        base = (settings or self.settings()).get("consolidated_base") or None
+        return consolidate(members, base)
 
     # ---- numbers -----------------------------------------------------------------------------------------
     def snapshot(self, account: str, settings: Optional[dict] = None,
                  portfolio: Optional[Portfolio] = None) -> Optional[Snapshot]:
-        p = portfolio or self.portfolio(account)
+        settings = settings or self.settings()
+        p = portfolio or self.portfolio(account, settings)
         if p is None:
             return None
-        settings = settings or self.settings()
         return self._snapshot(p, settings)
 
     def _snapshot(self, p: Portfolio, settings: dict) -> Snapshot:
@@ -130,8 +169,18 @@ class Tracker:
             return Snapshot(p, settings, md, None, [],
                             problem="No FX rate for " + ", ".join(md.missing_fx) +
                                     ". Press 'Refresh Prices' or enter a manual rate in the Market data tab.")
-        metrics = compute_metrics(p, md, float(settings.get("days_per_year") or 365))
-        return Snapshot(p, settings, md, metrics, reconcile(p, metrics))
+        days = float(settings.get("days_per_year") or 365)
+        metrics = compute_metrics(p, md, days)
+        snap = Snapshot(p, settings, md, metrics, reconcile(p, metrics))
+        if p.is_consolidated:                    # every account valued with the same prices and rates
+            for member in p.members:
+                mm = compute_metrics(member, md, days)
+                snap.account_checks[member.account] = reconcile(member, mm)
+                snap.accounts.append(AccountSummary(
+                    member.account, member.alias, member.base_currency, member.period_end, mm.stocks_usd, mm.cash_usd,
+                    mm.usd_total, mm.usd_deposits, mm.usd_return, mm.usd_cagr, mm.base_total, len(member.trades),
+                    share=(mm.usd_total / metrics.usd_total) if metrics.usd_total else None))
+        return snap
 
     # ---- Excel -------------------------------------------------------------------------------------------
     def workbook_path(self, p: Portfolio, settings: Optional[dict] = None) -> Path:
@@ -174,11 +223,12 @@ class Tracker:
     def export(self, account: str) -> RunOutcome:
         """Create / update / rebuild the workbook from the data already cached (no network)."""
         out = RunOutcome()
-        p = self.portfolio(account)
+        settings = self.settings()
+        p = self.portfolio(account, settings)
         if p is None:
             out.errors.append("No statements imported yet.")
             return out
-        settings = self._sync_overrides(p, self.settings(), out)
+        settings = self._sync_overrides(p, settings, out)
         out.snapshot = self._snapshot(p, settings)
         self._write_workbook(p, out.snapshot, out)
         return out
@@ -189,11 +239,11 @@ class Tracker:
         """Download new prices/FX (incrementally), then recalculate - and update the workbook in place when the
         *Export to Excel* option is on."""
         out = RunOutcome()
-        p = self.portfolio(account)
+        settings = self.settings()
+        p = self.portfolio(account, settings)
         if p is None:
             out.errors.append("No statements imported yet.")
             return out
-        settings = self.settings()
         out.report = self.service.refresh(p, settings, progress)
         if out.report.offline:
             out.messages.append("Price source is 'statements only' - nothing was downloaded. "
@@ -223,6 +273,27 @@ class Tracker:
 
     def history(self, account: str) -> list[dict]:
         return self.store.snapshots(account)
+
+    # ---- CSV export --------------------------------------------------------------------------------------
+    def csv_files(self, snap: Snapshot, style: Optional[str] = None) -> dict[str, bytes]:
+        """The tables of a snapshot (one account or the consolidated view) as CSV files: ``{file name: bytes}``.
+        ``style``: ``"international"`` or ``"european"`` (default: the ``csv_format`` setting)."""
+        from .exports import csv_files
+        return csv_files(snap, style)
+
+    def csv_zip(self, snap: Snapshot, style: Optional[str] = None) -> bytes:
+        from .exports import csv_zip
+        return csv_zip(snap, style)
+
+    def write_csv(self, snap: Snapshot, style: Optional[str] = None) -> list[Path]:
+        """Write the CSV files into ``<output folder>/IBKR_Portfolio_<account>_csv/``."""
+        folder = output_dir(snap.settings) / f"IBKR_Portfolio_{snap.portfolio.account}_csv"
+        folder.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for name, data in self.csv_files(snap, style).items():
+            (folder / name).write_bytes(data)
+            paths.append(folder / name)
+        return paths
 
     # ---- misc --------------------------------------------------------------------------------------------
     @staticmethod

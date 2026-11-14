@@ -19,6 +19,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "fx_overrides": {},                # "CCY" -> manual units of CCY per 1 USD
     "benchmark_override": None,        # manual benchmark price in USD
     "last_account": "",
+    "consolidated_base": "",           # base currency of the all-accounts view; empty = common base currency, else USD
+    "csv_format": "international",     # CSV dialect: "international" (, and .) | "european" (; and decimal comma)
 }
 
 
