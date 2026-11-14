@@ -1,0 +1,14 @@
+[server]
+headless = true
+address = "127.0.0.1"          # only this computer can reach the app (your portfolio is private)
+fileWatcherType = "none"
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#1F6FB2"

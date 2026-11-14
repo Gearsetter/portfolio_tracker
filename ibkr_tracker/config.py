@@ -1,0 +1,40 @@
+"""Paths and default settings."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "benchmark_symbol": "VUAA.L",      # Vanguard S&P 500 UCITS ETF (USD, Acc) on the London Stock Exchange - quoted in USD
+    "price_source": "yahoo",           # "yahoo" (online, falls back to statements) | "statement" (offline only)
+    "export_excel": True,              # the "export results as Excel" toggle
+    "output_dir": "",                  # empty -> <data dir>/output
+    "days_per_year": 365,              # used by the time-weighted CAGR
+    "recalc_with_libreoffice": True,   # store cached values in the .xlsx when LibreOffice is installed
+    "yahoo_symbols": {},               # "TICKER|CCY" -> Yahoo Finance symbol (overrides the automatic mapping)
+    "price_overrides": {},             # "TICKER|CCY" -> manual price
+    "fx_overrides": {},                # "CCY" -> manual units of CCY per 1 USD
+    "benchmark_override": None,        # manual benchmark price in USD
+    "last_account": "",
+}
+
+
+def data_dir() -> Path:
+    """Folder holding the archive database, the output workbooks and the settings.
+
+    Override with the ``IBKR_TRACKER_HOME`` environment variable; defaults to ``./data`` next to ``app.py``.
+    """
+    env = os.environ.get("IBKR_TRACKER_HOME")
+    base = Path(env).expanduser() if env else PROJECT_ROOT / "data"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def output_dir(settings: dict[str, Any] | None = None) -> Path:
+    custom = (settings or {}).get("output_dir") or ""
+    out = Path(custom).expanduser() if custom else data_dir() / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    return out

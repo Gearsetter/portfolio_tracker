@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0
+# optional: real-browser GUI smoke test (tests/test_gui.py::test_browser_smoke); then run `playwright install chromium`
+# playwright>=1.45
