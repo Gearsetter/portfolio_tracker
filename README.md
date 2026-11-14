@@ -11,6 +11,8 @@ periods, any number of accounts) and get
 * a professionally formatted, **formula‑driven Excel workbook** (`IBKR_Portfolio_<account>.xlsx`, or
   `IBKR_Portfolio_ALL.xlsx` for the consolidated portfolio) that the **Refresh Prices** button keeps up to date
   *in place* – without regenerating the file;
+* an optional **view filter** that hides fully closed positions and dust cash balances (< 0.5) from the dashboard
+  lists, the workbook and the CSV files – without changing a single total (§12);
 * a local **archive** (SQLite) of every statement, downloaded price/FX series and your settings, so history
   survives restarts and old statements can be combined with new ones.
 
@@ -46,6 +48,9 @@ address it prints yourself.
    `data/output/IBKR_Portfolio_<account>.xlsx` (`IBKR_Portfolio_ALL.xlsx` for the consolidated view). Change the
    folder under *Settings → Output folder*. The *Excel export* tab has the *Download* button for the workbook and the
    CSV files of the same tables.
+5. **Hide closed positions & dust balances** (sidebar toggle below the export toggle, off by default) – leaves
+   positions with zero shares and cash balances below 0.5 out of the dashboard tables and chart, the workbook and the
+   CSV files; totals, returns and the reconciliation are not affected (§12).
 
 A ready‑made example built from the two statements you supplied is in
 `examples/output/IBKR_Portfolio_U24013787_sample.xlsx` (see the limitation about prices in §9).
@@ -54,7 +59,8 @@ A ready‑made example built from the two statements you supplied is in
 base currency; stocks, cash, "what the same purchases would be worth in VUAA" and the **VUAA CAGR (USD)**; a small
 *Benchmark comparison · details* card (**Stocks minus VUAA (USD)**, stocks CAGR on the same basis, VUAA return,
 average years since the purchases); in the consolidated view an **Accounts** table; then positions, cash balances,
-allocation and the value history.
+allocation and the value history (with the view filter on, closed positions and dust balances are not listed there –
+a one‑line note says what was left out).
 
 ## 2. What the workbook contains
 
@@ -69,7 +75,7 @@ formulas black, cross‑sheet look‑ups green, yellow = cells you may overwrite
 | 4 | `A:G`, 5 empty rows below §3 | **Forex** – Currency Bought, Quantity, Price, Total, Fee, Currency Paid, Date (+ `H` fee currency) |
 | 5 | `J:P`, rows of §1 | Gross (`=Total+Fee`), Current Price, Current Total (`=Quantity × Current Price × share factor`, see §5), USD Total, USD Gross, USD Current Total, **VUAA Quantity** (`=USD Total / VUAA close on the purchase date`) (+ helpers `R:S`) |
 | 6 | `J:Q`, 5 empty rows below §5 | **Positions** – Ticker, **Quantity (shares according to the Open Positions section of the newest statement)**, Current Price, Value, Return (`=Value/Gross`), USD Value, USD Return, CAGR (left empty as specified) (+ helpers `R:T`: currency, sum of the transactions, share factor) |
-| 7 | `J:O`, directly below §6 | **Cash balances** – base currency, USD, EUR and every traded currency; ties to IBKR's *Ending Cash* |
+| 7 | `J:O`, directly below §6 | **Cash balances** – base currency, USD, EUR and every traded currency; ties to IBKR's *Ending Cash*. With the view filter on (§12) Sections 6 and 7 leave out closed positions and balances below 0.5 |
 | 8 | `J:Q`, 1 empty row below §7 | **Summary (USD)** – `O` Σ USD values, `P` = `O / Σ USD Amount (§3)`, `Q` time‑weighted CAGR |
 | 9 | `J:Q`, 1 empty row below §8 | **Summary (base currency)** – `M` = §8 `O` × latest USD/base rate, `N` return, `Q` CAGR |
 | 10 | below §9 | *Extra:* **benchmark block** – the same USD amounts invested in VUAA, value today, **Stocks minus VUAA (USD)**, average years since the purchases, **VUAA CAGR (USD)** and the stocks' CAGR on the same basis |
@@ -95,8 +101,8 @@ Only classic functions are used (`SUMIFS`, `INDEX/MATCH`, `IFERROR`, `SUMPRODUCT
    up quickly (offline) and keeps working with the cached / statement data.
 3. The existing workbook is updated **in place**: only `Prices`, `FX`, `Benchmark`, `About` (and the hidden state)
    are rewritten – every formula, format and comment of `Portfolio` and `Checks` stays exactly as it is and
-   recalculates. If the statement archive changed (new transactions, other layout version) the workbook is regenerated
-   and the previous file is kept as `…previous.xlsx`. The file is written atomically; if Excel has it open you get a
+   recalculates. If the statement archive changed (new transactions, other layout version) or you switched the view
+   filter (§12) the workbook is regenerated and the previous file is kept as `…previous.xlsx`. The file is written atomically; if Excel has it open you get a
    clear message and nothing is changed. The consolidated workbook is refreshed the same way.
 4. A value snapshot is stored at every refresh (Dashboard → *Value history*), separately for every account and for
    the consolidated view.
@@ -105,8 +111,8 @@ Only classic functions are used (`SUMIFS`, `INDEX/MATCH`, `IFERROR`, `SUMPRODUCT
 *Market data* tab. Edits made in Excel are adopted by the app at the next refresh (three‑way merge with the
 snapshot in `_state`; an edit in the file wins, clearing a cell removes the override).
 
-**Settings** (export toggle, price source, benchmark symbol, days per year, base currency of the consolidated view,
-CSV format, output folder, overrides, symbol mapping, last account) are stored in `data/tracker.db` and restored at
+**Settings** (export toggle, view filter, price source, benchmark symbol, days per year, base currency of the
+consolidated view, CSV format, output folder, overrides, symbol mapping, last account) are stored in `data/tracker.db` and restored at
 the next start.
 
 ## 4. Conventions and interpretation choices
@@ -215,7 +221,7 @@ ibkr_tracker/
   exports.py, tables.py    CSV export (international / European dialect) and the tables behind it and the GUI
   storage.py, tracker.py   archive + settings (SQLite) and the service layer used by the GUI
 scripts/make_sample_workbook.py   regenerates examples/output/*.xlsx offline from examples/statements
-tests/                     228 tests (pytest)
+tests/                     281 tests (pytest)
 .devcontainer/             VS Code dev container: Dockerfile, devcontainer.json, post-create.sh (see §11)
 .vscode/                   F5 debug configuration, tasks (run the app, tests), recommended extensions
 ```
@@ -266,6 +272,8 @@ hand‑computed ground truth (sells, withdrawal, fee, interest, EUR stock, EUR b
 2:1 stock split), the Open Positions rule (latest statement wins, every fallback, split scenario in Python, workbook
 and checks), the consolidated view (merged records, summed share counts and cash, additivity of the metrics,
 base‑currency choice, per‑account reconciliation, workbook with the Account column, CSV in both dialects, GUI),
+the view filter (the two rules and their boundaries, display‑only totals, tables / CSV / workbook with a fully closed
+position and a dust balance, empty sections, rebuild when the setting is switched, consolidated view, GUI),
 cell‑by‑cell comparison of the LibreOffice‑recalculated workbook with the Python numbers, layout/spacing rules of
 the specification, in‑place refresh and override merging, locked files, the GUI (Streamlit `AppTest` and an optional
 real‑browser smoke test), a check of the totals against IBKR's own *Open Positions*, *Cash Report* and NAV, and
@@ -304,7 +312,59 @@ Good to know
 * The container needs internet access for the Yahoo Finance download (and for the first build); behind a company proxy
   configure it in Docker Desktop.
 
+## 12. Hiding closed positions and dust balances
+
+One switch – the sidebar toggle **Hide closed positions & dust balances** (off by default, remembered like the other
+settings) – removes the clutter from every *list* of the app. It is a **view filter**: nothing is recalculated and no
+figure changes.
+
+| Rule | What is hidden |
+|---|---|
+| **Closed position** | a stock whose current share count is zero (Open Positions rule of §5) – it was sold completely |
+| **Dust balance** | a currency whose cash balance has an **absolute amount below 0.5**, counted in that currency's own units (strictly below: exactly 0.50 stays visible). This includes the rows that are always listed – USD and EUR with 0.00 – and rounding residue such as 0.0000000005 |
+
+**Where it applies**
+
+* **Dashboard** – the *Positions* table, the *Cash balances* table and the *Allocation (USD)* chart. A small caption
+  under the tables says how many items were hidden and what the hidden dust is worth in USD.
+* **Excel workbook** – Sections 6 and 7 of the `Portfolio` sheet list only the remaining rows. The layout depends on
+  the setting, so the workbook is **regenerated once when you switch it** (the previous file is kept as
+  `…previous.xlsx`); *Refresh Prices* keeps updating it in place afterwards. A workbook made without the filter stays
+  up to date as long as the filter is off. The *About* sheet says when the filter is on.
+* **CSV files** – `positions.csv` and `cash.csv` without the hidden rows; `summary.csv` gets two extra rows
+  (*Hidden closed positions*, *Hidden dust cash balances (included in the totals)*).
+* **Consolidated view** – the filter looks at the merged figures: a stock that is closed in every account, a currency
+  whose balance summed over the accounts is below 0.5.
+
+**What is never hidden – on purpose**
+
+* **Totals, returns, CAGR, the net asset value.** A closed position is worth nothing and a dust balance is small but
+  real, so both stay in the KPI cards and in Sections 8–10. In the workbook the hidden balances are added up by a
+  formula‑driven block on the `Checks` sheet (columns `I:K`, total named `Hidden_USD`); Section 8 is
+  `=SUM(…)+Hidden_USD`, so the total is the same with and without the filter, and still live.
+* **The transaction history** – Sections 1–5, the *Transactions* tab, `stock_transactions.csv`, `forex.csv` …: the
+  trades of a closed position are history. Their *Current Total* in Section 5 is still computed at today's price
+  (the share factor of such a lot is 1 because the trades add up to zero shares).
+* **The reconciliation** – the `Checks` sheet, the *Reconciliation* tab and `checks.csv` keep a row for every currency
+  and every position: a discrepancy must never disappear from view.
+* **Market data** – the *Market data* tab and the `Prices` / `FX` sheets list every stock and currency (a closed
+  position without a price is marked *not needed (position closed)*).
+
 ## Changelog
+
+**1.2.0**
+
+* **View filter – hide closed positions and dust balances** (§12). One sidebar toggle hides stocks with zero shares and
+  cash balances with an absolute amount below 0.5 from the dashboard (Positions table, Cash balances table, allocation
+  chart), the Excel workbook (Sections 6 and 7) and the CSV files (`positions.csv`, `cash.csv`). It is display only:
+  totals, returns, CAGR, the net asset value, the transaction history, the reconciliation and the market‑data tables
+  are complete either way. The workbook keeps its totals through a formula‑driven helper (`Checks!I:K`,
+  `Hidden_USD`) and is regenerated once when the setting is switched; workbooks made without the filter stay valid.
+* A closed position without a price is no longer reported as missing (*Market data* tab: "not needed (position
+  closed)"; no "No price available" warning), and neither is a stock whose price you typed in.
+* The message after a workbook rebuild now names the real reason (statement archive changed, layout version, filter).
+* Fixed: with no position left to list, *Stocks now – latest FX* in Section 10 of the workbook is 0 (it used to read the
+  first cash row).
 
 **1.1.0**
 

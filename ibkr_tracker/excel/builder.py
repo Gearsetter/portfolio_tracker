@@ -21,6 +21,7 @@ from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .. import __version__
+from ..config import hide_closed_dust
 from ..market.data import MarketData
 from ..portfolio import QTY_TOL, SRC_TRANSACTIONS, Portfolio
 from ..reconcile import NAV_REL_TOL, SHARE_CHECK, cash_tolerance
@@ -121,6 +122,21 @@ def fx_latest(ccy_expr: str) -> str:
     return f"INDEX(FXL_Used,MATCH({ccy_expr},FXL_Ccy,0))"
 
 
+# Checks sheet, columns I:K: the dust balances that the view filter leaves out of Section 7 (formula driven, so the
+# totals of Sections 8 / 9 and the NAV check keep including them).  Fixed position: title I1, header row 5, data from 6.
+HIDDEN_COLS = ("I", "J", "K")
+HIDDEN_HDR = 5
+HIDDEN_FIRST = 6
+HIDDEN_NAME = "Hidden_USD"
+
+
+def _cash_formula(ccy_ref: str) -> str:
+    """Net cash of one currency from the ledgers (Section 7, and the hidden-balance block of the Checks sheet)."""
+    return ("=SUMIFS(Dep_Amount,Dep_Ccy,{c})+SUMIFS(Div_Total,Div_Ccy,{c})-SUMIFS(Div_Tax,Div_Ccy,{c})"
+            "-SUMIFS(Trade_Gross,Trade_Ccy,{c})+SUMIFS(FXT_Qty,FXT_Bought,{c})-SUMIFS(FXT_Total,FXT_Paid,{c})"
+            "-SUMIFS(FXT_Fee,FXT_FeeCcy,{c})").format(c=ccy_ref)
+
+
 # ======================================================================================================
 # main entry point
 # ======================================================================================================
@@ -132,10 +148,10 @@ def build_workbook(portfolio: Portfolio, md: MarketData, settings: dict, generat
 
     base = portfolio.base_currency or "HUF"
     generated_at = generated_at or datetime.now()
-    positions = portfolio.positions_keys()
-    currencies = portfolio.currencies()
-    lay = Layout(len(portfolio.trades), len(portfolio.dividends), len(portfolio.cash_flows),
-                 len(portfolio.fx_trades), len(positions), len(currencies))
+    hide = hide_closed_dust(settings)
+    positions = portfolio.positions_keys()           # every stock ever held: Prices sheet, price look-ups, overrides
+    currencies = portfolio.currencies()              # every currency: FX table
+    lay = Layout.for_portfolio(portfolio, hide)      # Sections 6 / 7 without closed positions / dust balances if hiding
 
     wb = Workbook()
     ws = wb.active
@@ -152,9 +168,9 @@ def build_workbook(portfolio: Portfolio, md: MarketData, settings: dict, generat
     _write_prices(wsp, portfolio, md, settings, lay, base, positions, currencies, fx_cols, generated_at)
     _write_fx(wsf, md, fx_cols, wb)
     _write_bench(wsb, md, wb)
-    _write_portfolio(ws, wb, portfolio, md, lay, base, positions, currencies)
-    _write_checks(wsc, portfolio, lay, positions, currencies, base)
-    _write_about(wsa, portfolio, md, lay, base, generated_at)
+    _write_portfolio(ws, wb, portfolio, md, lay, base, positions, currencies, hide)
+    _write_checks(wsc, portfolio, md, lay, positions, currencies, base, hide)
+    _write_about(wsa, portfolio, md, lay, base, generated_at, hide)
     _define_names(wb, lay, positions, currencies, fx_cols)
     write_state(wb, portfolio, md, settings)
 
@@ -177,7 +193,11 @@ def _fx_columns(md: MarketData, base: str) -> list[str]:
 # Portfolio sheet
 # ======================================================================================================
 def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, lay: Layout, base: str,
-                     positions: list[tuple[str, str]], currencies: list[str]) -> None:
+                     all_positions: list[tuple[str, str]], all_currencies: list[str], hide: bool = False) -> None:
+    positions = p.visible_positions(hide)               # Section 6 rows (without the closed positions when hiding)
+    currencies = p.visible_currencies(hide)             # Section 7 rows (without the dust balances when hiding)
+    omitted = set(all_positions) - set(positions)       # closed positions that Section 6 does not list
+    dust = [c for c in all_currencies if c not in currencies]
     widths = dict(A=38, B=11, C=14, D=14, E=16, F=15, G=20, H=20, I=3, J=17, K=18, L=15, M=17, N=13, O=17,
                   P=15, Q=12, R=17, S=17, T=15)
     if p.is_consolidated:
@@ -209,7 +229,9 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
              "commission; for sells the negative of the net proceeds).", 300, 80)
     _comment(ws, f"L{lay.t_hdr}", "Current Total = Quantity x Current Price x share factor (Section 6, column T). "
              "The factor is 1 unless a stock split / transfer makes the statement's share count differ from the sum "
-             "of the transactions; it expresses the transaction in today's shares.", 340, 100)
+             "of the transactions; it expresses the transaction in today's shares."
+             + (" Closed positions are not listed in Section 6 (view filter): for their transactions the factor is "
+                "1 when the transactions add up to zero shares, else 0." if omitted else ""), 340, 100)
     _comment(ws, f"M{lay.t_hdr}", "Total converted to USD with the closing USD rate on the transaction date "
              "(as-of lookup in the FX sheet; unchanged for USD). Column O uses the SAME purchase-date rate by "
              "design, so it isolates the price performance from currency moves.", 340, 110)
@@ -227,7 +249,11 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         _put(ws, f"H{r}", t.dt, FMT_DT, F_INPUT)
         _put(ws, f"J{r}", f"=E{r}+F{r}", FMT_MONEY)
         _put(ws, f"K{r}", f'=INDEX(Px_Used,MATCH(B{r}&"|"&G{r},Px_Key,0))', FMT_PRICE, F_LINK)
-        _put(ws, f"L{r}", f"=C{r}*K{r}*SUMIFS(Pos_Factor,Pos_Ticker,B{r},Pos_Ccy,G{r})", FMT_MONEY)
+        if (t.ticker, t.currency) in omitted:        # not listed in Section 6: statement shares = 0
+            _put(ws, f"L{r}", f"=C{r}*K{r}*IF(ABS(SUMIFS(Trade_Qty,Trade_Ticker,B{r},Trade_Ccy,G{r}))<{QTY_TOL:.6f},1,0)",
+                 FMT_MONEY)
+        else:
+            _put(ws, f"L{r}", f"=C{r}*K{r}*SUMIFS(Pos_Factor,Pos_Ticker,B{r},Pos_Ccy,G{r})", FMT_MONEY)
         acct_cell(r, t.account)
         _put(ws, f"M{r}", f"=E{r}/R{r}", FMT_MONEY)
         _put(ws, f"N{r}", f"=J{r}/R{r}", FMT_MONEY)
@@ -350,32 +376,33 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
     for i, ccy in enumerate(currencies):
         r = lay.cash_first + i
         _put(ws, f"J{r}", ccy, font=F_INPUT)
-        cash = ("=SUMIFS(Dep_Amount,Dep_Ccy,$J{r})"
-                "+SUMIFS(Div_Total,Div_Ccy,$J{r})-SUMIFS(Div_Tax,Div_Ccy,$J{r})"
-                "-SUMIFS(Trade_Gross,Trade_Ccy,$J{r})"
-                "+SUMIFS(FXT_Qty,FXT_Bought,$J{r})-SUMIFS(FXT_Total,FXT_Paid,$J{r})"
-                "-SUMIFS(FXT_Fee,FXT_FeeCcy,$J{r})").format(r=r)
-        _put(ws, f"K{r}", cash, FMT_MONEY)
+        _put(ws, f"K{r}", _cash_formula(f"$J{r}"), FMT_MONEY)
         usd = f"K{r}/{fx_latest(f'$J{r}')}"
         _put(ws, f"O{r}", f"={usd}" if ccy in active or md.fx.has(ccy) else f"=IFERROR({usd},0)", FMT_MONEY, F_LINK)
         for col in "LMNPQ":
             _put(ws, f"{col}{r}", None)
-    _comment(ws, f"K{lay.cash_first}", "Section 7 - Net cash per currency = deposits/withdrawals/fees + dividends - "
-             "withholding tax/fees - stock trades (Gross) + forex bought - forex paid - forex fees. Ties to the "
-             "'Ending Cash' lines of the IBKR Cash Report (see the Checks sheet).", 360, 110)
+    if currencies:
+        _comment(ws, f"K{lay.cash_first}", "Section 7 - Net cash per currency = deposits/withdrawals/fees + dividends - "
+                 "withholding tax/fees - stock trades (Gross) + forex bought - forex paid - forex fees. Ties to the "
+                 "'Ending Cash' lines of the IBKR Cash Report (see the Checks sheet)."
+                 + (f" Balances below 0.5 ({', '.join(dust)}) are hidden by the view filter; they are still included "
+                    "in the totals (Checks sheet, column I:K)." if dust else ""), 360, 110)
 
     # ---- Section 8: USD summary ----------------------------------------------------------------------------
     s = lay.sum_usd
     for col in "JKLMNOPQ":
         _put(ws, f"{col}{s}", None, font=F_BOLD, fill=FILL_SUM, border=B_SUM)
     _put(ws, f"J{s}", "Summary (USD)", font=F_BOLD, fill=FILL_SUM, border=B_SUM)
-    _put(ws, f"O{s}", f"=SUM(O{lay.pos_first}:O{lay.cash_last})", FMT_MONEY + ' "USD"', F_BOLD, FILL_SUM, B_SUM)
+    _put(ws, f"O{s}", f"=SUM(O{lay.pos_first}:O{max(lay.pos_first, lay.cash_last)})" + ("+Hidden_USD" if dust else ""),
+         FMT_MONEY + ' "USD"', F_BOLD, FILL_SUM, B_SUM)
     _put(ws, f"P{s}", f'=IFERROR(O{s}/SUMIFS(Dep_USDAmt,Dep_Desc,"<>interest"),"")', FMT_RATIO, F_BOLD, FILL_SUM, B_SUM)
     _put(ws, f"Q{s}", f'=IFERROR(P{s}^(1/R{s})-1,"")', FMT_PCT, F_BOLD, FILL_SUM, B_SUM)
     _put(ws, f"R{s}", '=IFERROR(SUMPRODUCT(Dep_USDAmt*(Dep_Desc<>"interest")*(AsOfDate-INT(Dep_Date)))'
                       '/SUMIFS(Dep_USDAmt,Dep_Desc,"<>interest")/DaysPerYear,"")', FMT_YEARS, F_NORMAL, FILL_HELP, B_CELL)
     _put(ws, f"S{s}", "<- weighted avg. years since deposits", font=F_NOTE, border=None)
-    _comment(ws, f"O{s}", "Section 8 - Sum of the USD Value cells of Sections 6 and 7 (stocks + cash).", 280, 50)
+    _comment(ws, f"O{s}", "Section 8 - Sum of the USD Value cells of Sections 6 and 7 (stocks + cash)"
+             + (", plus the dust balances that the view filter hides from Section 7 (Checks sheet, Hidden_USD)."
+                if dust else "."), 280, 60)
     _comment(ws, f"P{s}", "Total USD value / sum of the USD Amount cells of Section 3 (deposits net of withdrawals "
              "and monthly fees; interest rows are not contributions).", 320, 80)
     _comment(ws, f"Q{s}", "Time-weighted CAGR = Return^(1 / weighted average years since deposits) - 1, weights = "
@@ -407,7 +434,8 @@ def _write_portfolio(ws: Worksheet, wb: Workbook, p: Portfolio, md: MarketData, 
         ("VUAA value (USD)", f"=K{b + 1}*K{b + 2}", FMT_MONEY),
         ("Invested in stocks (USD)", "=SUM(Trade_USDTotal)", FMT_MONEY),
         ("Stocks now - purchase-date FX (USD)", "=SUM(Trade_USDCur)", FMT_MONEY),
-        ("Stocks now - latest FX (USD)", f"=SUM(O{lay.pos_first}:O{max(lay.pos_first, lay.pos_last)})", FMT_MONEY),
+        ("Stocks now - latest FX (USD)",
+         f"=SUM(O{lay.pos_first}:O{lay.pos_last})" if lay.n_pos else "=0", FMT_MONEY),     # no rows: 0, not the cash row
         ("VUAA return", f'=IF(K{b + 1}>0,K{b + 3}/K{b + 4},"n/a")', FMT_RATIO),
         ("Stocks return (latest FX)", f'=IFERROR(K{b + 6}/K{b + 4},"n/a")', FMT_RATIO),
         ("Stocks minus VUAA (USD)", f'=IF(K{b + 1}>0,K{b + 6}-K{b + 3},"n/a")', FMT_MONEY),
@@ -563,10 +591,17 @@ def _write_bench(ws: Worksheet, md: MarketData, wb: Workbook) -> None:
 # ======================================================================================================
 # Checks and About
 # ======================================================================================================
-def _write_checks(ws: Worksheet, p: Portfolio, lay: Layout, positions: list[tuple[str, str]],
-                  currencies: list[str], base: str) -> None:
-    for col, w in dict(A=24, B=14, C=20, D=20, E=16, F=14, G=12).items():
+def _write_checks(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, positions: list[tuple[str, str]],
+                  currencies: list[str], base: str, hide: bool = False) -> None:
+    """Reconciliation with the statement.  ``positions`` / ``currencies`` are the COMPLETE lists: with the view filter on
+    the rows of hidden items stay (a discrepancy must never disappear from view) - they read the helper block at
+    I:K or the ledgers directly, because Sections 6 / 7 do not list them any more."""
+    for col, w in dict(A=24, B=14, C=20, D=20, E=16, F=14, G=12, H=3, I=16, J=18, K=18).items():
         ws.column_dimensions[col].width = w
+    shown_pos = {k: j for j, k in enumerate(p.visible_positions(hide))}      # -> row offset in Section 6
+    shown_ccy = {c: j for j, c in enumerate(p.visible_currencies(hide))}     # -> row offset in Section 7
+    dust = [c for c in currencies if c not in shown_ccy]
+    helper_row = {c: HIDDEN_FIRST + j for j, c in enumerate(dust)}
     refs = p.latest_statements()
     _put(ws, "A1", "Reconciliation with the IBKR statement", font=F_TITLE, border=None)
     src = "; ".join(f"{s.filename} (period end {s.period_end})" for s in refs) or "n/a"
@@ -585,12 +620,15 @@ def _write_checks(ws: Worksheet, p: Portfolio, lay: Layout, positions: list[tupl
     r = 6
     first = r
     ending = p.reference_cash()
-    for i, ccy in enumerate(currencies):
+    for ccy in currencies:
         if ccy in ending:
             _put(ws, f"A{r}", "Cash balance")
             _put(ws, f"B{r}", ccy, align="center")
             _put(ws, f"C{r}", ending[ccy], "#,##0.000000", F_INPUT)
-            _put(ws, f"D{r}", f"={L.PORTFOLIO}!K{lay.cash_first + i}", "#,##0.000000", F_LINK)
+            if ccy in shown_ccy:
+                _put(ws, f"D{r}", f"={L.PORTFOLIO}!K{lay.cash_first + shown_ccy[ccy]}", "#,##0.000000", F_LINK)
+            else:                                              # hidden dust balance: the helper block below
+                _put(ws, f"D{r}", f"=J{helper_row[ccy]}", "#,##0.000000")
             _put(ws, f"E{r}", f"=D{r}-C{r}", "#,##0.000000")
             _put(ws, f"F{r}", "=$B$3", "0.0000")
             _put(ws, f"G{r}", f'=IF(ABS(E{r})<=F{r},"OK","CHECK")', align="center")
@@ -601,7 +639,10 @@ def _write_checks(ws: Worksheet, p: Portfolio, lay: Layout, positions: list[tupl
             _put(ws, f"A{r}", SHARE_CHECK)
             _put(ws, f"B{r}", ticker, align="center")
             _put(ws, f"C{r}", held.get((ticker, ccy), 0.0), "General", F_INPUT)
-            _put(ws, f"D{r}", f"={L.PORTFOLIO}!S{lay.pos_first + i}", "General", F_LINK)
+            if (ticker, ccy) in shown_pos:
+                _put(ws, f"D{r}", f"={L.PORTFOLIO}!S{lay.pos_first + shown_pos[(ticker, ccy)]}", "General", F_LINK)
+            else:                                              # closed position hidden from Section 6: sum it here
+                _put(ws, f"D{r}", f'=SUMIFS(Trade_Qty,Trade_Ticker,B{r},Trade_Ccy,"{ccy}")', "General", F_LINK)
             _put(ws, f"E{r}", f"=D{r}-C{r}", "0.000000")
             _put(ws, f"F{r}", QTY_TOL, "0.000000", F_INPUT)
             _put(ws, f"G{r}", f'=IF(ABS(E{r})<=F{r},"OK","INFO")', align="center")
@@ -634,11 +675,36 @@ def _write_checks(ws: Worksheet, p: Portfolio, lay: Layout, positions: list[tupl
     ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"OK"'], fill=green))
     ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"CHECK"'], fill=red))
     ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"INFO"'], fill=amber))
+    if dust:
+        _write_hidden_block(ws, md, p, dust)
     ws.sheet_properties.tabColor = "70AD47"
     _print_setup(ws)
 
 
-def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base: str, generated_at: datetime) -> None:
+def _write_hidden_block(ws: Worksheet, md: MarketData, p: Portfolio, dust: list[str]) -> None:
+    """Checks!I:K - net cash and USD value of every balance that the view filter hides from Section 7.  Its total
+    (defined name ``Hidden_USD``) is added to the Section 8 total, so the filter never changes a figure."""
+    ci, cn, cu = HIDDEN_COLS
+    _put(ws, f"{ci}1", "Hidden cash balances (view filter)", font=F_BOLD, border=None)
+    _put(ws, f"{ci}3", "Balances below 0.5 are not listed in Section 7 but still count in the totals "
+         "(Section 8 = Sections 6 + 7 + this total).", font=F_NOTE, border=None)
+    _header(ws, HIDDEN_HDR, [(ci, "Currency"), (cn, "Net cash"), (cu, "USD value")])
+    active = set(p.active_currencies())
+    for j, ccy in enumerate(dust):
+        r = HIDDEN_FIRST + j
+        _put(ws, f"{ci}{r}", ccy, font=F_INPUT, align="center")
+        _put(ws, f"{cn}{r}", _cash_formula(f"${ci}{r}"), "#,##0.000000")
+        usd = f"{cn}{r}/{fx_latest(f'${ci}{r}')}"
+        _put(ws, f"{cu}{r}", f"={usd}" if ccy in active or md.fx.has(ccy) else f"=IFERROR({usd},0)", FMT_MONEY, F_LINK)
+    total = HIDDEN_FIRST + len(dust)
+    _put(ws, f"{ci}{total}", "Total (USD)", font=F_BOLD, fill=FILL_SUM, border=B_SUM)
+    _put(ws, f"{cn}{total}", None, font=F_BOLD, fill=FILL_SUM, border=B_SUM)
+    _put(ws, f"{cu}{total}", f"=SUM({cu}{HIDDEN_FIRST}:{cu}{total - 1})", FMT_MONEY, F_BOLD, FILL_SUM, B_SUM)
+    _name(ws.parent, HIDDEN_NAME, f"{L.CHECKS}!${cu}${total}")
+
+
+def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base: str, generated_at: datetime,
+                 hide: bool = False) -> None:
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 110
     _put(ws, "A1", "IBKR Portfolio Tracker - about this workbook", font=F_TITLE, border=None)
@@ -650,6 +716,16 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
         ("Market data", md.mode),
         ("Valuation date", f"{md.as_of}"),
     ]
+    if hide:                                    # only mentioned when the view filter is on
+        closed = [t for t, c in p.positions_keys() if (t, c) not in set(p.visible_positions(True))]
+        dust = [c for c in p.currencies() if c not in set(p.visible_currencies(True))]
+        what = []
+        if closed:
+            what.append(f"{len(closed)} closed position(s): {', '.join(closed)}")
+        if dust:
+            what.append(f"{len(dust)} cash balance(s) below 0.5: {', '.join(dust)}")
+        info.append(("View filter", "ON - Sections 6 and 7 leave out " + ("; ".join(what) if what else "nothing right now")
+                     + ". Totals, returns and CAGR still include everything and the Checks sheet stays complete."))
     r = 3
     for k, v in info:
         _put(ws, f"A{r}", k, font=F_BOLD, border=None)
@@ -812,7 +888,7 @@ def write_state(wb: Workbook, p: Portfolio, md: MarketData, settings: dict) -> N
     flat = OV.from_settings(
         dict(settings, price_overrides=md.price_overrides, fx_overrides=md.fx_overrides,
              benchmark_override=md.benchmark_override), p.positions_keys(), fx_ccys)
-    values = dict(layout=L.WORKBOOK_VERSION, archive=p.signature(), account=p.account,
+    values = dict(layout=L.layout_tag(hide_closed_dust(settings)), archive=p.signature(), account=p.account,
                   overrides=json.dumps(flat, sort_keys=True))
     for key, row in OV.STATE_ROWS.items():
         ws.cell(row, 1).value = key
@@ -849,9 +925,9 @@ def refresh_market_sheets(wb: Workbook, p: Portfolio, md: MarketData, settings: 
         raise MissingMarketData("No FX rate available for " + ", ".join(md.missing_fx) + ".")
     base = p.base_currency or "HUF"
     generated_at = generated_at or datetime.now()
-    positions, currencies = p.positions_keys(), p.currencies()
-    lay = Layout(len(p.trades), len(p.dividends), len(p.cash_flows), len(p.fx_trades), len(positions),
-                 len(currencies))
+    hide = hide_closed_dust(settings)
+    positions, currencies = p.positions_keys(), p.currencies()      # Prices / FX keep every stock and currency
+    lay = Layout.for_portfolio(p, hide)                              # the Portfolio sheet as it was built
     fx_cols = _fx_columns(md, base)
 
     wsp = wb[L.PRICES]
@@ -859,7 +935,7 @@ def refresh_market_sheets(wb: Workbook, p: Portfolio, md: MarketData, settings: 
     _write_prices(wsp, p, md, settings, lay, base, positions, currencies, fx_cols, generated_at)
     _write_fx(_fresh_sheet(wb, L.FXSHEET), md, fx_cols, wb)
     _write_bench(_fresh_sheet(wb, L.BENCH), md, wb)
-    _write_about(_fresh_sheet(wb, L.ABOUT), p, md, lay, base, generated_at)
+    _write_about(_fresh_sheet(wb, L.ABOUT), p, md, lay, base, generated_at, hide)
     _define_names(wb, lay, positions, currencies, fx_cols)
     write_state(wb, p, md, settings)
     wb.calculation.fullCalcOnLoad = True

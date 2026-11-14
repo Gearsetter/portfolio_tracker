@@ -43,6 +43,13 @@ PX_BENCH_COLS = dict(symbol="A", last="B", day="C", source="D", override="E", us
 
 STATE = "_state"                               # hidden sheet: layout version, archive signature, override snapshot
 WORKBOOK_VERSION = "ibkr-portfolio-tracker/layout-2"   # bump whenever the cell geometry / formulas change
+FILTER_TAG = "+filter"                         # appended to the layout version of a workbook built with the view filter
+
+
+def layout_tag(hide: bool = False) -> str:
+    """What the hidden state sheet stores as ``layout``: the layout version, plus ``+filter`` when Sections 6 / 7 were
+    built without the closed positions and dust balances - switching the setting makes the file stale."""
+    return WORKBOOK_VERSION + (FILTER_TAG if hide else "")
 
 
 @dataclass
@@ -109,6 +116,13 @@ class Layout:
     # Section 10 (benchmark comparison, one empty row after Section 9)
     @property
     def bm_hdr(self) -> int: return self.sum_base + 2
+
+    @staticmethod
+    def for_portfolio(p, hide: bool = False) -> "Layout":
+        """Geometry of the workbook of ``p``; with ``hide`` Sections 6 / 7 list only the open positions and the
+        non-dust cash balances (``Portfolio.visible_positions`` / ``visible_currencies``)."""
+        return Layout(len(p.trades), len(p.dividends), len(p.cash_flows), len(p.fx_trades),
+                      len(p.visible_positions(hide)), len(p.visible_currencies(hide)))
 
     @staticmethod
     def rng(first: int, last: int, col: str, sheet: str = PORTFOLIO) -> str:

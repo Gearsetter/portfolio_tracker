@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from .calc import Metrics, compute_metrics
-from .config import output_dir
+from .config import hide_closed_dust, output_dir
 from .excel import (MissingMarketData, WorkbookLocked, WorkbookUpdate, find_soffice, open_current, refresh_workbook,
                     sync_overrides)
 from .market import MarketData, MarketDataService, RefreshReport
@@ -188,10 +188,11 @@ class Tracker:
 
     def workbook_status(self, p: Portfolio, settings: Optional[dict] = None) -> tuple[str, str, Path]:
         """``("missing"|"current"|"stale", detail, path)``."""
+        settings = settings or self.settings()
         path = self.workbook_path(p, settings)
         if not path.exists():
             return "missing", "no workbook has been generated yet", path
-        wb, reason = open_current(path, p)
+        wb, reason = open_current(path, p, hide_closed_dust(settings))
         if wb is not None:
             return "current", "it matches the current statement archive", path
         return "stale", reason, path

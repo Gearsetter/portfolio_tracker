@@ -30,6 +30,8 @@ class Truth:
     n_fx_trades: int = 1
     n_cash_flows: int = 6
     n_dividends: int = 3
+    closed: tuple = ()                                                       # fully closed positions (closed_position=True)
+    dust: dict[str, float] = field(default_factory=dict)                    # sub-0.5 balances (dust_currency=True)
 
 
 def _row(*cells) -> str:
@@ -38,9 +40,13 @@ def _row(*cells) -> str:
     return buf.getvalue()
 
 
+GBP_PER_EUR_CLOSE = 1.17                  # period-end closing rate of the dust currency (1 GBP = 1.17 EUR)
+
+
 def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025, 12, 31),
              only_before: date | None = None, only_from: date | None = None,
-             split: tuple[str, float, date] | None = None, open_positions: bool = True) -> tuple[bytes, Truth]:
+             split: tuple[str, float, date] | None = None, open_positions: bool = True,
+             closed_position: bool = False, dust_currency: bool = False) -> tuple[bytes, Truth]:
     """Statement text + ground truth.  ``only_before`` / ``only_from`` keep just the transactions dated before /
     from that day (to build overlapping or consecutive statements out of one ledger).  ``truth.cash`` / ``positions``
     describe the transactions that were kept.
@@ -49,7 +55,11 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
     to that day, whichever of them the file lists - and a stock split ``(symbol, ratio, day)`` multiplies the shares
     (and divides the close price) from ``day`` on WITHOUT touching the trades, exactly the situation in which the
     sum of the transactions no longer equals the share count.  The split also adds a "Corporate Actions" section.
-    ``open_positions=False`` leaves the section out (a custom statement)."""
+    ``open_positions=False`` leaves the section out (a custom statement).
+
+    ``closed_position=True`` adds TSLA (USD): bought 2, sold 2 - a position that is fully closed, so it is in the
+    transaction history but not in the Open Positions.  ``dust_currency=True`` adds two GBP forex trades that leave
+    0.45 GBP behind (a residual balance below 0.5) - both for the "hide closed positions and dust balances" filter."""
     def keep(d: date) -> bool:
         return (only_before is None or d < only_before) and (only_from is None or d >= only_from)
 
@@ -70,6 +80,8 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
     # ---- ledger ----------------------------------------------------------------------------------------------
     t = Truth()
     cash = {"EUR": 0.0, "USD": 0.0}
+    if dust_currency:
+        cash["GBP"] = 0.0
 
     deposits = [("EUR", date(2025, 1, 10), 10000.0, "Wire Transfer In (Initial funding)"),
                 ("EUR", date(2025, 3, 5), 5000.0, "Wire Transfer In"),
@@ -83,6 +95,14 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
     dividends = [("AAPL", "US0378331005", "USD", date(2025, 2, 13), 0.25, 2.50, -0.38, "US Tax", 0.0),
                  ("SAP", "DE0007164600", "EUR", date(2025, 5, 20), 2.35, 11.75, -3.10, "DE Tax", 0.0),
                  ("AAPL", "US0378331005", "USD", date(2025, 8, 14), 0.25, 1.50, -0.23, "US Tax", -0.05)]
+
+    if closed_position:
+        stocks += [("TSLA", "USD", datetime(2025, 2, 20, 16, 0, 0), 2.0, 200.0, -1.0),
+                   ("TSLA", "USD", datetime(2025, 5, 6, 16, 0, 0), -2.0, 230.0, -1.0)]
+        t.closed = (("TSLA", "USD"),)
+    if dust_currency:
+        fx += [("GBP", "USD", datetime(2025, 4, 2, 10, 0, 0), 100.30, 1.27, -2.0),       # buy 100.30 GBP with USD
+               ("GBP", "USD", datetime(2025, 4, 3, 10, 0, 0), -99.85, 1.28, -2.0)]       # sell 99.85 GBP: 0.45 left
 
     for ccy, d, amt, _ in deposits:
         if keep(d):
@@ -110,6 +130,8 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
         if keep(d):
             cash[ccy] += tot + tax + fee
     t.cash = {k: round(v, 10) for k, v in cash.items()}
+    if dust_currency:
+        t.dust = {"GBP": t.cash["GBP"]}
     t.positions = pos
     n_st = sum(1 for s in stocks if keep(s[2].date()))
     t.n_stock_trades, t.n_fx_trades = n_st, sum(1 for f in fx if keep(f[2].date()))
@@ -119,7 +141,7 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
 
     # ---- cash report / NAV ------------------------------------------------------------------------------------
     add(_row("Cash Report", "Header", "Currency Summary", "Currency", "Total", "Securities", "Futures", ""))
-    for ccy in ("EUR", "USD"):
+    for ccy in ("EUR", "USD", *(("GBP",) if dust_currency else ())):
         add(_row("Cash Report", "Data", "Starting Cash", ccy, 0, 0, 0, ""))
         add(_row("Cash Report", "Data", "Ending Cash", ccy, repr(t.cash[ccy]), repr(t.cash[ccy]), 0, ""))
     add(_row("Cash Report", "Data", "Ending Cash", "Base Currency Summary", repr(t.cash["EUR"]), repr(t.cash["EUR"]), 0, ""))
@@ -133,6 +155,9 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
              0, 0, 0, 0, 0, ""))
     add(_row("Mark-to-Market Performance Summary", "Data", "Forex", "USD", 0, t.cash["USD"], "--",
              f"{EUR_PER_USD_CLOSE:.4f}", 0, 0, 0, 0, 0, ""))
+    if dust_currency:
+        add(_row("Mark-to-Market Performance Summary", "Data", "Forex", "GBP", 0, t.cash["GBP"], "--",
+                 f"{GBP_PER_EUR_CLOSE:.4f}", 0, 0, 0, 0, 0, ""))
 
     # ---- open positions: what is held at the end of the period -----------------------------------------------------
     held: dict[tuple[str, str], float] = {}
@@ -219,6 +244,9 @@ def make_csv(period_start: date = date(2025, 1, 1), period_end: date = date(2025
              "NASDAQ", 1, "COMMON", ""))
     add(_row("Financial Instrument Information", "Data", "Stocks", "SAP", "SAP SE", 14204, "DE0007164600", "SAP",
              "IBIS", 1, "COMMON", ""))
+    if closed_position:
+        add(_row("Financial Instrument Information", "Data", "Stocks", "TSLA", "TESLA INC", 76792991, "US88160R1014",
+                 "TSLA", "NASDAQ", 1, "COMMON", ""))
     return ("\n".join(L) + "\n").encode("utf-8"), t
 
 

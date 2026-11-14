@@ -2,7 +2,9 @@
 
 Works completely offline: prices and FX come from the statements themselves (the VUAA benchmark columns stay
 empty until *Refresh Prices* has downloaded data).  When the statements belong to more than one account, the
-consolidated (all accounts merged) workbook ``IBKR_Portfolio_ALL_sample.xlsx`` is written as well.  Usage::
+consolidated (all accounts merged) workbook ``IBKR_Portfolio_ALL_sample.xlsx`` is written as well, and every account
+also gets ``IBKR_Portfolio_<account>_sample_filtered.xlsx`` - the same workbook with the *hide closed positions and
+dust balances* filter on (Sections 6 and 7 without the empty USD / EUR balances; the totals are identical).  Usage::
 
     python scripts/make_sample_workbook.py
 """
@@ -46,6 +48,15 @@ def main() -> int:
             print(f"{out.update.action}: {dest}")
             if out.update.recalc is not None:
                 print("  ", out.update.recalc.message)
+            if account != CONSOLIDATED:                              # the same workbook with the view filter on
+                t.update_settings(hide_closed_dust=True)
+                out = t.export(account)
+                t.update_settings(hide_closed_dust=False)
+                if out.update is None:
+                    return 1
+                dest = target_dir / f"{out.update.path.stem}_sample_filtered.xlsx"
+                shutil.copy2(out.update.path, dest)
+                print(f"{out.update.action} (view filter on): {dest}")
     if find_soffice() is None:
         print("LibreOffice not found: the file has formulas but no cached values (Excel calculates them on open).")
     return 0

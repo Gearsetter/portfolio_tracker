@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ibkr_tracker import __version__                                   # noqa: E402
 from ibkr_tracker import tables as T                                   # noqa: E402
+from ibkr_tracker.config import hide_closed_dust                       # noqa: E402
 from ibkr_tracker.exports import CSV_STYLE_LABELS, CSV_STYLES, csv_style  # noqa: E402
 from ibkr_tracker.market.symbols import yahoo_symbol                   # noqa: E402
 from ibkr_tracker.portfolio import CONSOLIDATED, CONSOLIDATED_LABEL    # noqa: E402
@@ -103,8 +104,8 @@ def post_outcome(out: RunOutcome, what: str) -> None:
     for e in out.errors:
         flash("error", e)
     if out.update is not None:
-        verb = {"updated": "updated in place", "rebuilt": "rebuilt (the statement archive changed)",
-                "created": "created"}[out.update.action]
+        why = f" - {out.update.reason}" if out.update.reason else ""
+        verb = {"updated": "updated in place", "rebuilt": "rebuilt" + why, "created": "created"}[out.update.action]
         flash("success", f"{what}: Excel workbook {verb}: {out.update.path}")
         if out.update.backup:
             flash("info", f"The previous workbook was kept as {out.update.backup.name}.")
@@ -173,6 +174,11 @@ def sidebar(tracker: Tracker) -> tuple[Optional[str], dict, bool]:
         export = st.toggle("Export results as Excel file", value=bool(settings.get("export_excel")), key="w_export",
                            help="When on, importing statements and pressing Refresh Prices also writes/updates "
                                 "the formula-driven .xlsx workbook.")
+        hide = st.toggle("Hide closed positions & dust balances", value=hide_closed_dust(settings), key="w_hide",
+                         help="Leaves out positions with 0 shares and cash balances whose absolute amount is below 0.5 "
+                              "(in the balance's own currency) - on the dashboard (tables and allocation chart), in "
+                              "the Excel workbook and in the CSV files. Display only: totals, returns and CAGR "
+                              "still include them, and the transaction history and the reconciliation stay complete.")
         with st.expander("Settings", expanded=False):
             source = st.selectbox(
                 "Price source", ["yahoo", "statement"], key="w_source",
@@ -200,15 +206,19 @@ def sidebar(tracker: Tracker) -> tuple[Optional[str], dict, bool]:
                                  help="Excel recalculates the workbook anyway. Embedding values only makes the "
                                       "file readable in previewers that do not calculate."
                                       + ("" if lo_ok else " LibreOffice was not found on this computer."))
-        new = dict(export_excel=bool(export), price_source=source, benchmark_symbol=bench.strip() or "VUAA.L",
+        new = dict(export_excel=bool(export), hide_closed_dust=bool(hide), price_source=source,
+                   benchmark_symbol=bench.strip() or "VUAA.L",
                    days_per_year=float(days), output_dir=out_dir.strip(),
                    consolidated_base=(cons_base.strip().upper() if len(cons_base.strip()) == 3 else ""),
                    recalc_with_libreoffice=bool(recalc) if lo_ok else bool(settings.get("recalc_with_libreoffice")))
         if any(settings.get(k) != v for k, v in new.items()):
-            was_on = bool(settings.get("export_excel"))
+            was_on, was_hidden = bool(settings.get("export_excel")), hide_closed_dust(settings)
             settings = tracker.update_settings(**new)
-            if new["export_excel"] and not was_on and account:         # just switched on: write the file right away
-                with st.spinner("Writing the Excel workbook ..."):
+            filter_changed = new["hide_closed_dust"] != was_hidden
+            if new["export_excel"] and account and (not was_on or filter_changed):
+                # just switched on, or the view filter changed (Sections 6 / 7 list other rows): write the file now
+                with st.spinner("Rebuilding the Excel workbook ..." if filter_changed and was_on
+                                else "Writing the Excel workbook ..."):
                     post_outcome(tracker.export(account), "Export")
     return account, settings, bool(refresh)
 
@@ -243,6 +253,7 @@ def dashboard(snap: Snapshot) -> None:
     m, md, p, s = snap.metrics, snap.md, snap.portfolio, snap.settings
     base = m.base_currency
     bench_label = (s.get("benchmark_symbol") or "benchmark").split(".")[0]
+    hide = hide_closed_dust(s)                         # view filter: closed positions / dust balances are not listed
 
     c = st.columns(4)
     kpi(c[0], "Total value (USD)", fmt_money(m.usd_total, "USD"), help="Σ USD Value of positions + cash (Sections 6-8).")
@@ -300,7 +311,7 @@ def dashboard(snap: Snapshot) -> None:
                    "'Total value (account base)' is in that account's own base currency.")
 
     st.markdown("#### Positions")
-    pos = T.positions_table(m)
+    pos = T.positions_table(m, hide)
     pos["Gain"] = (pd.to_numeric(pos["Return"], errors="coerce") - 1) * 100
     pos["USD Gain"] = (pd.to_numeric(pos["USD Return"], errors="coerce") - 1) * 100
     show_df(pos[["Ticker", "Name", "Currency", "Quantity", "Current Price", "Value", "Return", "Gain", "USD Value",
@@ -313,17 +324,23 @@ def dashboard(snap: Snapshot) -> None:
         "USD Value": st.column_config.NumberColumn(format="%.2f"),
         "USD Return": st.column_config.NumberColumn(format="%.4fx"),
         "USD Gain": st.column_config.NumberColumn(format="%+.2f%%")})
+    if hide and (note := T.hidden_note(m, hide, "closed")):
+        st.caption(note)
 
     left, right = st.columns([1, 1])
     with left:
         st.markdown("#### Cash balances")
-        cash = T.cash_table(m)
+        cash = T.cash_table(m, hide)
         show_df(cash, column_config={"Net cash": st.column_config.NumberColumn(format="%.2f"),
                                      "USD Value": st.column_config.NumberColumn(format="%.2f")})
+        if hide and (note := T.hidden_note(m, hide, "dust")):
+            st.caption(note)
     with right:
         st.markdown("#### Allocation (USD)")
-        alloc = [{"Holding": r.ticker, "USD": r.usd_value} for r in m.positions if abs(r.usd_value) > 1e-9]
-        alloc += [{"Holding": f"Cash {r.currency}", "USD": r.usd_value} for r in m.cash if abs(r.usd_value) >= 0.005]
+        alloc = [{"Holding": r.ticker, "USD": r.usd_value} for r in m.visible_positions(hide)
+                 if abs(r.usd_value) > 1e-9]
+        alloc += [{"Holding": f"Cash {r.currency}", "USD": r.usd_value} for r in m.visible_cash(hide)
+                  if abs(r.usd_value) >= 0.005]
         if alloc:
             st.bar_chart(pd.DataFrame(alloc), x="Holding", y="USD", horizontal=True, **stretch())
 
@@ -534,6 +551,10 @@ def export_tab(tracker: Tracker, snap: Snapshot) -> None:
         st.info("No workbook has been generated yet.")
     if not s.get("export_excel"):
         st.caption("Automatic export is switched **off** (sidebar). Use the button below to generate the file once.")
+    if hide_closed_dust(s):
+        st.caption("The view filter is **on** (sidebar): closed positions and cash balances below 0.5 are left out of "
+                   "Sections 6 and 7 of the workbook and of positions.csv / cash.csv. Totals, returns and CAGR still "
+                   "include them; transaction history and the Checks sheet stay complete.")
     c1, c2 = st.columns(2)
     if c1.button("📄  Create / update workbook now", key="export_now", **stretch()):
         with st.spinner("Writing the workbook ..."):

@@ -17,6 +17,7 @@ from typing import Optional
 import pandas as pd
 
 from . import tables as T
+from .config import hide_closed_dust
 from .tracker import Snapshot
 
 CSV_STYLES: dict[str, dict[str, str]] = {
@@ -49,15 +50,18 @@ def _decimal_comma(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def csv_tables(snap: Snapshot) -> dict[str, pd.DataFrame]:
-    """``{file name: table}`` - empty tables are left out."""
+    """``{file name: table}`` - empty tables are left out.  With the view filter on (closed positions with zero
+    shares, cash balances below 0.5) ``positions.csv`` and ``cash.csv`` do not list them; the transaction tables are
+    history and always complete, and so are the totals in ``summary.csv``."""
     m, p = snap.metrics, snap.portfolio
     if m is None:
         return {}
     acct = p.is_consolidated
+    hide = hide_closed_dust(snap.settings)
     tables = {
-        "summary.csv": T.summary_table(m, p),
-        "positions.csv": T.positions_table(m),
-        "cash.csv": T.cash_table(m),
+        "summary.csv": T.summary_table(m, p, hide),
+        "positions.csv": T.positions_table(m, hide),
+        "cash.csv": T.cash_table(m, hide),
         "stock_transactions.csv": T.trades_table(m, acct),
         "dividends.csv": T.dividends_table(p, acct),
         "deposits_withdrawals.csv": T.deposits_table(m, acct),

@@ -15,6 +15,9 @@ Definitions (identical to the spreadsheet):
   today's shares for the "Current Total" columns, so that they add up to the value of the position.
 * VUAA CAGR (USD): every stock transaction replayed into the benchmark ETF (Section 5, column P);
   ``(VUAA value / invested) ** (1 / purchase-weighted average years) - 1`` with the USD Totals as weights.
+* View filter (setting "hide closed positions and dust balances"): ``Metrics.visible_positions`` /
+  ``visible_cash`` leave out positions with zero shares and cash balances below 0.5.  It only decides what is
+  *listed* - ``positions`` and ``cash`` stay complete and every total, return and CAGR includes everything.
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ from typing import Optional
 
 from .market.data import MarketData
 from .models import StockTrade
-from .portfolio import Portfolio
+from .portfolio import Portfolio, is_closed, is_dust
 
 CONTRIBUTION_EXCLUDED = {"interest"}
 
@@ -102,6 +105,20 @@ class BenchmarkResult:
 
 
 @dataclass
+class HiddenItems:
+    """What the view filter leaves out of the lists (the totals still include all of it)."""
+    closed: list["PositionRow"] = field(default_factory=list)       # positions with zero shares
+    dust: list["CashRow"] = field(default_factory=list)             # cash balances with |amount| < 0.5
+
+    @property
+    def dust_usd(self) -> float:
+        return sum(c.usd_value for c in self.dust)
+
+    def __bool__(self) -> bool:
+        return bool(self.closed or self.dust)
+
+
+@dataclass
 class Metrics:
     base_currency: str
     as_of: date
@@ -121,6 +138,22 @@ class Metrics:
     base_return: Optional[float]
     base_cagr: Optional[float]
     benchmark: BenchmarkResult = field(default_factory=BenchmarkResult)
+
+    # ---- view filter (display only) ----------------------------------------------------------------------
+    def visible_positions(self, hide: bool = False) -> list[PositionRow]:
+        """Section 6 rows to list: without the fully closed positions (zero shares) when ``hide`` is on."""
+        return [r for r in self.positions if not (hide and is_closed(r.quantity))]
+
+    def visible_cash(self, hide: bool = False) -> list[CashRow]:
+        """Section 7 rows to list: without the dust balances (|amount| < 0.5) when ``hide`` is on."""
+        return [c for c in self.cash if not (hide and is_dust(c.balance))]
+
+    def hidden(self, hide: bool = True) -> HiddenItems:
+        """The positions / balances that ``hide`` leaves out (nothing when it is off)."""
+        if not hide:
+            return HiddenItems()
+        return HiddenItems([r for r in self.positions if is_closed(r.quantity)],
+                           [c for c in self.cash if is_dust(c.balance)])
 
 
 def _cagr(ratio: Optional[float], years: Optional[float]) -> Optional[float]:

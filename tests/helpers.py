@@ -10,9 +10,9 @@ from ibkr_tracker.excel.layout import Layout
 from ibkr_tracker.portfolio import Portfolio
 
 
-def layout_for(p: Portfolio) -> Layout:
-    return Layout(len(p.trades), len(p.dividends), len(p.cash_flows), len(p.fx_trades), len(p.positions_keys()),
-                  len(p.currencies()))
+def layout_for(p: Portfolio, hide: bool = False) -> Layout:
+    """Geometry of the workbook of ``p`` - with the view filter on Sections 6 / 7 list fewer rows."""
+    return Layout.for_portfolio(p, hide)
 
 
 def close(a: Any, b: Any, rel: float = 1e-9, abs_: float = 1e-9) -> bool:
@@ -24,9 +24,12 @@ def close(a: Any, b: Any, rel: float = 1e-9, abs_: float = 1e-9) -> bool:
 
 
 def compare_portfolio_sheet(vals: dict[str, Any], p: Portfolio, m: Metrics,
-                            lay: Optional[Layout] = None) -> list[str]:
-    """``vals`` = {coordinate: value} of the Portfolio sheet.  Returns a list of mismatch descriptions."""
-    lay = lay or layout_for(p)
+                            lay: Optional[Layout] = None, hide: bool = False) -> list[str]:
+    """``vals`` = {coordinate: value} of the Portfolio sheet.  Returns a list of mismatch descriptions.
+
+    ``hide``: the workbook was built with the view filter - Sections 6 / 7 list only ``m.visible_positions`` /
+    ``m.visible_cash``, while every total (Sections 8 / 9 / 10) still covers everything."""
+    lay = lay or layout_for(p, hide)
     bad: list[str] = []
 
     def chk(ref: str, expected: Any, rel: float = 1e-9, abs_: float = 1e-9) -> None:
@@ -56,14 +59,14 @@ def compare_portfolio_sheet(vals: dict[str, Any], p: Portfolio, m: Metrics,
         chk(f"B{row}", f.quantity)
         chk(f"D{row}", f.quantity * f.price)
         chk(f"E{row}", f.fee)
-    for i, pos in enumerate(m.positions):
+    for i, pos in enumerate(m.visible_positions(hide)):
         row = lay.pos_first + i
         if vals.get(f"J{row}") != pos.ticker:
             bad.append(f"J{row}: ticker {vals.get(f'J{row}')!r} != {pos.ticker!r}")
         for col, exp in (("K", pos.quantity), ("L", pos.price), ("M", pos.value), ("N", pos.ret),
                          ("O", pos.usd_value), ("P", pos.usd_ret), ("S", pos.tx_quantity), ("T", pos.share_factor)):
             chk(f"{col}{row}", exp)
-    for i, c in enumerate(m.cash):
+    for i, c in enumerate(m.visible_cash(hide)):
         row = lay.cash_first + i
         if vals.get(f"J{row}") != c.currency:
             bad.append(f"J{row}: currency {vals.get(f'J{row}')!r} != {c.currency!r}")

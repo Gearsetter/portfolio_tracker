@@ -3,8 +3,9 @@
 * **updated** - the file is an up-to-date workbook of this app (same layout version, same archive signature):
   only the market-data sheets (Prices / FX / Benchmark / About) are rewritten.  Every formula, format and
   comment of the Portfolio and Checks sheets stays untouched - this is what the *Refresh Prices* button does.
-* **rebuilt** - the statement archive changed (new transactions, other account/base currency ...) or the file was
-  made by another layout version: the workbook is generated again; the previous file is kept as ``*.previous.xlsx``.
+* **rebuilt** - the statement archive changed (new transactions, other account/base currency ...), the file was
+  made by another layout version, or the *hide closed positions and dust balances* setting was switched (Sections 6 / 7
+  list different rows): the workbook is generated again; the previous file is kept as ``*.previous.xlsx``.
 * **created** - no file yet.
 """
 from __future__ import annotations
@@ -20,6 +21,7 @@ from typing import Optional
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 
+from ..config import hide_closed_dust
 from ..market.data import MarketData
 from ..portfolio import Portfolio
 from . import layout as L
@@ -56,8 +58,14 @@ def _restore_comment_sizes(wb: Workbook) -> None:
                     c.height = int(min(260, max(50, 28 + 15 * math.ceil(len(c.text or "") / 52))))
 
 
-def open_current(path: Path, portfolio: Portfolio) -> tuple[Optional[Workbook], str]:
-    """``(workbook, "")`` if ``path`` is an up-to-date workbook of this app for ``portfolio``, else ``(None, why)``."""
+FILTER_CHANGED = "the 'Hide closed positions and dust balances' setting changed"
+
+
+def open_current(path: Path, portfolio: Portfolio, hide: bool = False) -> tuple[Optional[Workbook], str]:
+    """``(workbook, "")`` if ``path`` is an up-to-date workbook of this app for ``portfolio``, else ``(None, why)``.
+
+    ``hide`` is the view filter (closed positions / dust balances left out of Sections 6 and 7): a file built with the
+    other setting has another geometry and is stale.  Without the filter a v1.1.0 workbook stays current."""
     if not path.exists():
         return None, "no workbook yet"
     try:
@@ -67,8 +75,11 @@ def open_current(path: Path, portfolio: Portfolio) -> tuple[Optional[Workbook], 
     state = OV.read_state(wb)
     if not state:
         return None, "existing file was not created by this app"
-    if state.get("layout") != L.WORKBOOK_VERSION:
+    layout = str(state.get("layout") or "")
+    if layout.removesuffix(L.FILTER_TAG) != L.WORKBOOK_VERSION:
         return None, "existing file uses another layout version"
+    if layout != L.layout_tag(hide):
+        return None, FILTER_CHANGED
     missing = [s for s in REQUIRED_SHEETS if s not in wb.sheetnames]
     if missing:
         return None, "existing file lacks the sheet(s) " + ", ".join(missing)
@@ -124,7 +135,7 @@ def refresh_workbook(path: Path | str, portfolio: Portfolio, md: MarketData, set
     """Bring the workbook at ``path`` up to date with ``portfolio`` and ``md`` (see the module docstring)."""
     path = Path(path)
     existed = path.exists()
-    wb, reason = open_current(path, portfolio)
+    wb, reason = open_current(path, portfolio, hide_closed_dust(settings))
     backup: Optional[Path] = None
     if wb is not None:
         _restore_comment_sizes(wb)

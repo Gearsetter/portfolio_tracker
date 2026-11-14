@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Callable, Optional
 
-from ..portfolio import Portfolio
+from ..portfolio import Portfolio, is_closed
 from ..storage import Store
 from .data import BenchSeries, FxSeries, FxTable, MarketData, PricePoint
 from .fallback import statement_fx, statement_prices
@@ -139,6 +139,7 @@ class MarketDataService:
         raw: dict[str, PricePoint] = {}
         symbols: dict[str, str] = {}
         yahoo_used = False
+        held = portfolio.net_quantities()
         for ticker, ccy in portfolio.positions_keys():
             key = f"{ticker}|{ccy}"
             sym = self.symbol_for(portfolio, settings, ticker, ccy)
@@ -156,7 +157,9 @@ class MarketDataService:
             stmt = stmt_px.get(key)
             chosen = cached if cached and (stmt is None or cached.day >= stmt.day) else stmt
             if chosen is None:
-                notes.append(f"No price available for {ticker} ({ccy}): refresh online or enter a manual price.")
+                # worth nothing without shares, and nothing to ask for when the user already typed a price
+                if key not in price_over and not is_closed(held.get((ticker, ccy), 0.0)):
+                    notes.append(f"No price available for {ticker} ({ccy}): refresh online or enter a manual price.")
                 continue
             yahoo_used |= chosen is cached
             raw[key] = chosen

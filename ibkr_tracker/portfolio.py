@@ -36,6 +36,7 @@ from .parsing.util import parse_rate
 T = TypeVar("T")
 AMOUNT_TOL = 0.0051          # IBKR's HTML rounds amounts to cents
 QTY_TOL = 1e-6               # share counts closer than this are the same
+DUST_THRESHOLD = 0.5         # a cash balance below this (absolute, in its own currency) is "dust" for the view filter
 CONSOLIDATED = "ALL"         # account id of the consolidated (all accounts merged) portfolio
 CONSOLIDATED_LABEL = "All accounts (consolidated)"
 
@@ -85,6 +86,16 @@ def merge_multiset(batches: Sequence[Sequence[T]], key_fn: Callable[[T], Hashabl
 # --------------------------------------------------------------------------------------
 # portfolio container
 # --------------------------------------------------------------------------------------
+def is_closed(quantity: float) -> bool:
+    """A position with (practically) no shares left - fully closed."""
+    return abs(quantity) < QTY_TOL
+
+
+def is_dust(balance: float) -> bool:
+    """A residual cash balance: absolute amount below :data:`DUST_THRESHOLD` (in the balance's own currency)."""
+    return abs(balance) < DUST_THRESHOLD
+
+
 @dataclass
 class Portfolio:
     account: str
@@ -163,6 +174,24 @@ class Portfolio:
                 out.append(c)
         out.extend(sorted(c for c in active if c not in out))
         return out
+
+    # ---- view filter: closed positions and dust balances ------------------------------------------------
+    # Display only: the totals, returns and CAGR always include every position and every balance.
+    def visible_positions(self, hide: bool = False) -> list[tuple[str, str]]:
+        """:meth:`positions_keys` without the fully closed positions (zero shares) when ``hide`` is on."""
+        keys = self.positions_keys()
+        if not hide:
+            return keys
+        held = self.net_quantities()
+        return [k for k in keys if not is_closed(held.get(k, 0.0))]
+
+    def visible_currencies(self, hide: bool = False) -> list[str]:
+        """:meth:`currencies` without the dust balances (|balance| < 0.5) when ``hide`` is on."""
+        ccys = self.currencies()
+        if not hide:
+            return ccys
+        bal = self.cash_balances()
+        return [c for c in ccys if not is_dust(bal.get(c, 0.0))]
 
     def first_activity(self) -> Optional[date]:
         dates: list[date] = [t.dt.date() for t in self.trades] + [f.dt.date() for f in self.fx_trades] \

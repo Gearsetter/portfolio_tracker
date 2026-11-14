@@ -21,6 +21,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_account": "",
     "consolidated_base": "",           # base currency of the all-accounts view; empty = common base currency, else USD
     "csv_format": "international",     # CSV dialect: "international" (, and .) | "european" (; and decimal comma)
+    "hide_closed_dust": False,         # view filter: hide positions with 0 shares and cash balances below 0.5
 }
 
 
@@ -40,3 +41,8 @@ def output_dir(settings: dict[str, Any] | None = None) -> Path:
     out = Path(custom).expanduser() if custom else data_dir() / "output"
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def hide_closed_dust(settings: dict | None) -> bool:
+    """The view filter (closed positions with zero shares + cash balances below 0.5): on or off."""
+    return bool((settings or {}).get("hide_closed_dust"))

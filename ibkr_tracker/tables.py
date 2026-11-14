@@ -6,7 +6,7 @@ from typing import Optional
 import pandas as pd
 
 from .calc import Metrics
-from .portfolio import Portfolio
+from .portfolio import Portfolio, is_closed
 from .reconcile import CheckRow
 
 
@@ -58,18 +58,36 @@ def forex_table(p: Portfolio, with_account: bool = False) -> pd.DataFrame:
     return _with_account(df, [f.account for f in p.fx_trades], with_account)
 
 
-def positions_table(m: Metrics) -> pd.DataFrame:
+def positions_table(m: Metrics, hide: bool = False) -> pd.DataFrame:
     """Section 6.  ``Quantity`` is the share count of the latest statement's Open Positions; the last two columns
-    show the sum of the transactions and the resulting factor (differs from 1 after a stock split, a transfer...)."""
+    show the sum of the transactions and the resulting factor (differs from 1 after a stock split, a transfer...).
+    ``hide`` leaves out the fully closed positions (zero shares)."""
     return pd.DataFrame([{
         "Ticker": r.ticker, "Name": r.name, "Currency": r.currency, "Quantity": r.quantity,
         "Current Price": r.price, "Value": r.value, "Return": r.ret, "USD Value": r.usd_value,
         "USD Return": r.usd_ret, "CAGR": None, "Quantity (transactions)": r.tx_quantity,
-        "Share factor": r.share_factor} for r in m.positions])
+        "Share factor": r.share_factor} for r in m.visible_positions(hide)])
 
 
-def cash_table(m: Metrics) -> pd.DataFrame:
-    return pd.DataFrame([{"Currency": c.currency, "Net cash": c.balance, "USD Value": c.usd_value} for c in m.cash])
+def cash_table(m: Metrics, hide: bool = False) -> pd.DataFrame:
+    """Section 7.  ``hide`` leaves out the dust balances (absolute amount below 0.5)."""
+    return pd.DataFrame([{"Currency": c.currency, "Net cash": c.balance, "USD Value": c.usd_value}
+                         for c in m.visible_cash(hide)])
+
+
+def hidden_note(m: Metrics, hide: bool, part: str = "all") -> str:
+    """One line saying what the view filter left out ('' when nothing was hidden).  ``part``: ``"closed"`` (positions
+    table), ``"dust"`` (cash table) or ``"all"``."""
+    h = m.hidden(hide)
+    parts = []
+    if h.closed and part in ("all", "closed"):
+        parts.append(f"{len(h.closed)} closed position{'s' if len(h.closed) != 1 else ''}")
+    if h.dust and part in ("all", "dust"):
+        parts.append(f"{len(h.dust)} cash balance{'s' if len(h.dust) != 1 else ''} below 0.5 "
+                     f"(together {h.dust_usd:,.2f} USD)")
+    if not parts:
+        return ""
+    return "Hidden by the filter: " + " and ".join(parts) + ". The totals, returns and CAGR above still include them."
 
 
 def checks_table(rows: list[CheckRow]) -> pd.DataFrame:
@@ -89,14 +107,17 @@ def snapshots_table(rows: list[dict]) -> pd.DataFrame:
 def prices_table(md, portfolio: Portfolio, settings: dict) -> pd.DataFrame:
     """Status of every price the valuation uses (GUI *Market data* tab)."""
     rows = []
+    held = portfolio.net_quantities()
     for ticker, ccy in portfolio.positions_keys():
         key = f"{ticker}|{ccy}"
         raw = md.raw_prices.get(key)
         used = md.prices.get(key)
+        no_price = ("not needed (position closed)" if is_closed(held.get((ticker, ccy), 0.0))
+                    else "MISSING - refresh or enter an override")          # zero shares are worth nothing, price or not
         rows.append({
             "Ticker": ticker, "Currency": ccy, "Yahoo symbol": md.yahoo_symbols.get(key, ticker),
             "Last close": raw.price if raw else None, "Price date": raw.day if raw else None,
-            "Source": raw.source if raw else "MISSING - refresh or enter an override",
+            "Source": raw.source if raw else no_price,
             "Override": _num((settings.get("price_overrides") or {}).get(key)),
             "Price used": used.price if used else None})
     return pd.DataFrame(rows)
@@ -129,8 +150,9 @@ def accounts_table(rows) -> pd.DataFrame:
         for a in rows])
 
 
-def summary_table(m: Metrics, p: Portfolio) -> pd.DataFrame:
-    """Sections 8-10 as plain rows (Excel / CSV export of the headline figures)."""
+def summary_table(m: Metrics, p: Portfolio, hide: bool = False) -> pd.DataFrame:
+    """Sections 8-10 as plain rows (Excel / CSV export of the headline figures).  With the view filter on, two rows
+    say what was left out of the position / cash lists (the figures themselves always include it)."""
     b = m.benchmark
     rows = [
         ("Portfolio", p.label, ""),
@@ -149,4 +171,8 @@ def summary_table(m: Metrics, p: Portfolio) -> pd.DataFrame:
         ("Stocks minus benchmark (USD)", b.excess_usd, "USD"),
         ("Average years since the stock purchases", b.years, "years"),
     ]
+    h = m.hidden(hide)
+    if h:
+        rows += [("Hidden closed positions", len(h.closed), "positions"),
+                 ("Hidden dust cash balances (included in the totals)", h.dust_usd, "USD")]
     return pd.DataFrame(rows, columns=["Item", "Value", "Unit"])
