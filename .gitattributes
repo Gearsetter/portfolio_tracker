@@ -1,9 +1,13 @@
-# Files that run inside Linux (the dev container) must keep LF line endings, even when the repository is checked out
+# Files that run inside Linux (the dev container, the Docker image) must keep LF line endings, even when the repository is checked out
 # on Windows with core.autocrlf=true - a CRLF in a shell script breaks it ("bash\r: No such file or directory").
 *.sh              text eol=lf
 .devcontainer/**  text eol=lf
 .dockerignore     text eol=lf
 .editorconfig     text eol=lf
+Dockerfile        text eol=lf
+docker-compose.yml text eol=lf
+.env.example      text eol=lf
+docker/**         text eol=lf
 
 # Windows launcher
 *.bat             text eol=crlf

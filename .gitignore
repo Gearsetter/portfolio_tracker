@@ -5,3 +5,4 @@ __pycache__/
 data/
 *.previous.xlsx
 *.tmp.xlsx
+.env

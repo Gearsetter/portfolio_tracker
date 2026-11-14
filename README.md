@@ -42,12 +42,14 @@ Requirements: **Python 3.10 – 3.13**. LibreOffice is optional (see §8).
 | Windows | double‑click `run_app.bat` |
 | macOS / Linux | `./run_app.sh` |
 | any | `pip install -r requirements.txt` then `streamlit run app.py` (or `python app.py`) |
-| VS Code + Docker | *Dev Containers: Reopen in Container*, then **F5** – nothing else to install, see §11 |
+| VS Code + Docker | *Dev Containers: Reopen in Container*, then **F5** – nothing else to install, see §11.1 |
+| Docker (no VS Code) | `docker compose up --build`, then open `http://localhost:8501` – nothing else to install, see §11.2 |
 
 The launch scripts create a private virtual environment in `.venv` on the first start, install
 `requirements.txt` and open the app in your browser (`http://localhost:8501`; set `IBKR_TRACKER_PORT` for another
 port). The server listens on this computer only (`.streamlit/config.toml`). With `streamlit run app.py` open the
-address it prints yourself.
+address it prints yourself. All start options use the same data folder, `./data` (§7), so you can switch between
+them at any time.
 
 1. **Import Activity Statements** in the sidebar (CSV and/or HTML; IBKR Client Portal → *Performance & Reports →
    Statements → Activity*, custom date range). Drop several files at once – also from several accounts;
@@ -253,8 +255,11 @@ ibkr_tracker/
   exports.py, tables.py    CSV export (international / European dialect) and the tables behind it and the GUI
   storage.py, tracker.py   archive + settings (SQLite) and the service layer used by the GUI
 scripts/make_sample_workbook.py   regenerates examples/output/*.xlsx offline from examples/statements
-tests/                     590 tests (pytest)
-.devcontainer/             VS Code dev container: Dockerfile, devcontainer.json, post-create.sh (see §11)
+tests/                     632 tests (pytest)
+.devcontainer/             VS Code dev container: Dockerfile, devcontainer.json, post-create.sh (see §11.1)
+Dockerfile, docker-compose.yml, docker/entrypoint.sh, .env.example
+                           plain Docker container: runs the app without VS Code or Python (see §11.2)
+.dockerignore              allow-list for both images: statements, data and .git never enter an image
 .vscode/                   F5 debug configuration, tasks (run the app, tests), recommended extensions
 ```
 
@@ -308,6 +313,7 @@ there – in *Protected View* click **Enable Editing** once and Excel fills in t
 ```
 pip install -r requirements-dev.txt
 python -m pytest            # about a minute; browser test is skipped unless Playwright + Chromium are installed
+RUN_DOCKER_TESTS=1 python -m pytest tests/test_docker.py   # optional: also builds the image (§11.2) and starts it
 ```
 
 Highlights: parsing of both formats against the same statement, merge / de‑duplication, a synthetic account with
@@ -343,7 +349,27 @@ Tracker: the saved classification and risk‑free rates, the CSV files, the cons
 sheets recalculated by LibreOffice and compared with the Python engine cell by cell, both currencies, with and without
 risk‑free rates, a USD‑only and a consolidated account, a workbook without prices, in‑place refresh of a 1.3 workbook).
 
-## 11. Development container (VS Code)
+The plain container (1.4.1, §11.2) has `test_docker.py`: it cross‑checks `Dockerfile`, `docker-compose.yml`,
+`docker/entrypoint.sh`, `.env.example` and `.dockerignore` with each other and with the app (port, bind address, data
+folder, build arguments and their defaults, what the build context lets through – and keeps out –, capabilities, line
+endings, the README), validates the compose file with `docker compose config` where the Docker CLI is installed and –
+opt‑in with `RUN_DOCKER_TESTS=1`, because it builds the image – starts the container and checks that it becomes healthy,
+does not run as root and writes the imported archive as the host user.
+
+## 11. Docker: development container and plain container
+
+Two Docker setups are included. Both use the same stack – **Ubuntu 24.04, Python 3.12, LibreOffice Calc 24.2**, the one
+the project is tested with – and neither needs anything on your computer except Docker.
+
+| | For | Start | Files |
+|---|---|---|---|
+| **§11.1 Development container** | working on the code in VS Code: debugger (F5), tests, tasks | *Dev Containers: Reopen in Container* | `.devcontainer/` |
+| **§11.2 Plain container** | just *using* the app – no VS Code, no Python | `docker compose up --build` | `Dockerfile`, `docker-compose.yml`, `docker/` |
+
+Both keep the data in `./data` – the folder `run_app.sh` / `run_app.bat` use as well – so you can switch between them
+at any time (just not run two of them on the same folder at the same time).
+
+### 11.1 Development container (VS Code)
 
 `.devcontainer/` is a ready‑made development environment: **Ubuntu 24.04, Python 3.12, LibreOffice Calc 24.2** and all
 Python packages (runtime and `pytest`) – the stack the project is tested with. Nothing has to be installed on your
@@ -352,7 +378,7 @@ computer except Docker and VS Code.
 1. Install **Docker** (Docker Desktop on Windows / macOS, Docker Engine on Linux) and the VS Code extension
    **Dev Containers** (`ms-vscode-remote.remote-containers`; VS Code suggests it when it opens the folder).
 2. Open the project folder in VS Code and run **Dev Containers: Reopen in Container** (Command Palette). The first
-   build creates an image of about 1.5 GB and takes a few minutes; later starts take seconds.
+   build creates an image of about 2 GB and takes a few minutes; later starts take seconds.
 3. Press **F5** (*Run and Debug → Streamlit: IBKR Portfolio Tracker*): the app starts under the debugger and the
    browser opens at `http://localhost:8501`. Or type `./run_app.sh` in the VS Code terminal.
 4. **Terminal → Run Task → Tests: all** (or `python -m pytest`) runs the test suite; the *Testing* view lists the tests
@@ -369,12 +395,85 @@ Good to know
   uses that environment (`IBKR_TRACKER_VENV`) instead of creating `.venv`. After changing `requirements*.txt` run
   *Dev Containers: Rebuild Container*.
 * **Build options** – `.devcontainer/devcontainer.json` → `build.args`: `INSTALL_LIBREOFFICE` (default `"true"`, about
-  0.5 GB: cached values in the workbook and the tests that recalculate it) and `INSTALL_PLAYWRIGHT` (default `"false"`;
+  0.8 GB: cached values in the workbook and the tests that recalculate it) and `INSTALL_PLAYWRIGHT` (default `"false"`;
   `"true"` adds Chromium, about 0.7 GB, for the real‑browser smoke test). Change the value, then *Rebuild Container*.
 * **Windows:** for fast file access keep the project in the WSL 2 file system (for example `\\wsl$\Ubuntu\home\you\…`)
   and open it from there. `.gitattributes` keeps the shell scripts at LF line endings – a CRLF checkout would break them.
 * The container needs internet access for the Yahoo Finance download (and for the first build); behind a company proxy
   configure it in Docker Desktop.
+
+### 11.2 Plain container (docker compose)
+
+Runs the finished app in a container – for using the tracker without installing Python, LibreOffice or VS Code. The
+image holds the program only; the statement archive and the workbooks stay in `./data` on your computer. Statements are
+imported the usual way in the browser (the browser uploads them – there is nothing to mount).
+
+1. Install **Docker** – Docker Desktop on Windows / macOS; on Linux Docker Engine with the Compose plugin
+   (`docker compose version` has to work).
+2. Open a terminal in the project folder (the one with `docker-compose.yml`) and run
+
+   ```
+   docker compose up --build
+   ```
+
+   The first build creates an image of about 2 GB (Ubuntu, the Python packages, LibreOffice) and takes a few minutes;
+   later starts take seconds. When the log shows `URL: http://localhost:8501`, open that address in your browser.
+   (The log always names the port *inside* the container; if you changed `IBKR_TRACKER_PORT`, use that one.)
+3. **Ctrl+C** stops it. In the background: `docker compose up -d`, then `docker compose logs -f` follows the log and
+   `docker compose ps` shows `healthy` as soon as the app answers. `docker compose down` removes the container – your
+   data stays – and `docker compose down --rmi all` removes the image as well. After replacing the project folder by a
+   newer version run `docker compose up --build` again, so that the image is rebuilt.
+
+Without compose, the same in two commands (PowerShell: `-v "${PWD}/data:/data"`):
+
+```
+docker build -t ibkr-portfolio-tracker .
+docker run --rm -p 127.0.0.1:8501:8501 -v "$(pwd)/data:/data" ibkr-portfolio-tracker
+```
+
+**Settings** (all optional) live in a file named `.env` next to `docker-compose.yml` – copy `.env.example` and remove
+the `#` in front of a line:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IBKR_TRACKER_PORT` | `8501` | port of your computer the app opens on, e.g. `8502` while the dev container uses 8501 |
+| `IBKR_TRACKER_BIND` | `127.0.0.1` | address the port is published on – see *Privacy* below |
+| `TZ` | `UTC` | time zone of the container; the workbook's *generated* / *last refresh* times are local times – use your zone, e.g. `Europe/Budapest` |
+| `INSTALL_LIBREOFFICE` | `true` | build option: `false` makes the image about 1 GB smaller; Excel then calculates the workbook when you open it (§8) |
+| `APP_UID`, `APP_GID` | `1000` | build option: user / group id of the app user in the image – rarely needed, see *File ownership* below |
+
+A new port, address or time zone applies with `docker compose up -d`; the build options with `docker compose up -d --build`.
+
+Good to know
+
+* **Your data stays on your computer, in `./data`**: `tracker.db` and `output/` with the workbooks (the *Download* button
+  of the *Excel export* tab works as usual). It is the folder `run_app.sh` / `run_app.bat` and the dev container use,
+  too. The image contains no statements and no data; `docker compose down` and rebuilds never touch the folder – back it
+  up by copying it. Leave **Settings → Output folder** empty: a path of your computer does not exist inside the
+  container, and the workbooks belong in `./data/output`.
+* **Privacy: the port is published on this computer only** (`127.0.0.1`). The app has no login and shows your whole
+  portfolio – change `IBKR_TRACKER_BIND` (to `0.0.0.0`, say) only if you really want everybody in your network to see
+  it. Inside the container the app runs as an unprivileged user with all Linux capabilities dropped and
+  `no-new-privileges`; `.dockerignore` is an allow‑list, so no statement, database, `.env` or `.git` folder can enter an
+  image. (`.streamlit/config.toml` keeps the app on `127.0.0.1` for the other start options; in the container
+  environment variables let it listen on all interfaces of the *container* – otherwise the published port could not
+  reach it – and the port mapping decides who may connect.)
+* **It comes back with Docker.** `docker-compose.yml` says `restart: unless-stopped`: a container started with
+  `docker compose up -d` is started again whenever Docker starts (after a reboot, say) until you run
+  `docker compose stop` or `docker compose down`. Delete that line if you do not want this.
+* **File ownership (Linux).** `docker/entrypoint.sh` starts as root for a moment, makes `./data` usable and then runs the
+  app as an unprivileged user – as the *owner of the folder*, so the files the app writes stay yours. Create the folder
+  first (`mkdir data`); if Docker creates it, it belongs to root and is handed over to user 1000. Docker Desktop
+  (Windows, macOS), rootless Docker and Podman need nothing. If the log shows `WARNING: … not writable`, follow its
+  advice; on SELinux hosts (Fedora, RHEL) write `./data:/data:z` in `docker-compose.yml`.
+* **Dev container and plain container** both want port 8501: while the dev container is running put
+  `IBKR_TRACKER_PORT=8502` into `.env` (or stop one of them). Do not let both work on the same `./data` at the same time –
+  two programs writing one SQLite file through different file‑sharing layers.
+* **Internet access** is needed for the build and for the Yahoo Finance download – normal Docker networking is enough;
+  behind a company proxy configure it in Docker Desktop. Without it the app falls back to the statement prices (§3).
+* **Windows:** `.gitattributes` keeps the Docker files at LF line endings (a CRLF checkout would break
+  `docker/entrypoint.sh`; the build repairs that, too). As for the dev container, a project in the WSL 2 file system is
+  faster than one on a Windows drive.
 
 ## 12. Hiding closed positions and dust balances
 
@@ -624,6 +723,21 @@ are taken out on the day they happen.
   past and say nothing about the future.
 
 ## Changelog
+
+**1.4.1**
+
+* **Plain Docker container** (§11.2): `docker compose up --build` runs the app in a container – no VS Code, no Python and
+  no LibreOffice on your computer needed – at `http://localhost:8501`. New files: `Dockerfile`, `docker-compose.yml`,
+  `docker/entrypoint.sh`, `.env.example`; `.dockerignore` is now an allow‑list for both images. The data stays in
+  `./data` (the folder the launch scripts and the dev container use), the port is published on this computer only, the
+  app runs as an unprivileged user (on Linux it adopts the owner of `./data`, so the files stay yours) and the settings –
+  port, time zone, build options – come from an optional `.env` file. A health check, a clean stop and a start‑up that
+  does not wait for the internet are part of the image.
+* **The VS Code dev container is unchanged** (`.devcontainer/`, `.vscode/` and the launch scripts are byte for byte the
+  same as in 1.4.0); both ways of running the app in Docker are available side by side (§11).
+* The application itself did not change – `app.py` and `ibkr_tracker/` differ from 1.4.0 only in the version number;
+  every figure, setting and workbook sheet is as before (the sample workbooks were regenerated for the version stamp
+  only). README: the image size figures of the dev container corrected. 42 new tests (632 in all).
 
 **1.4.0**
 

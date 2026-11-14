@@ -1,5 +1,15 @@
-# The dev container image is built with the project root as context (.devcontainer/Dockerfile).
-# Send only what the build needs - never the statements, the database in data/, .venv or .git.
+# Both images - the dev container (.devcontainer/Dockerfile) and the plain container (Dockerfile, docker-compose.yml) -
+# are built with the project root as context. Send only what the builds need: never the statements, the database in
+# data/, .env, .venv or .git. Allow-list: everything is excluded (*), the files below are let through again.
 *
+# dev container: Python environment
 !requirements.txt
 !requirements-dev.txt
+# plain container: the application and its start script
+!app.py
+!ibkr_tracker
+!.streamlit/config.toml
+!docker/entrypoint.sh
+# ... but no byte code of the host's Python
+**/__pycache__
+**/*.pyc

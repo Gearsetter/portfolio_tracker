@@ -1,0 +1,56 @@
+# IBKR Portfolio Tracker - run the app in a plain Docker container (no VS Code needed).
+#
+#   docker compose up --build      first start (builds the image - a few minutes), then open http://localhost:8501
+#   docker compose up -d           start in the background        docker compose logs -f   follow the log
+#   docker compose down            stop and remove the container  (your data stays in ./data)
+#
+# Your data - the statement archive (tracker.db) and the Excel workbooks - lives in the folder ./data next to this file:
+# the same folder that run_app.sh / run_app.bat and the VS Code dev container use. README, section 11.2.
+#
+# Settings (all optional): copy .env.example to .env and edit it - port, time zone, build options.
+name: ibkr-portfolio-tracker
+
+services:
+  tracker:
+    image: ibkr-portfolio-tracker:latest
+    container_name: ibkr-portfolio-tracker
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_LIBREOFFICE: ${INSTALL_LIBREOFFICE:-true}
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    init: true
+    restart: unless-stopped
+
+    # The app has no login: it is published on this computer only (127.0.0.1), never on the network.
+    # (change the port with IBKR_TRACKER_PORT in .env, e.g. to run next to the dev container)
+    ports:
+      - "${IBKR_TRACKER_BIND:-127.0.0.1}:${IBKR_TRACKER_PORT:-8501}:8501"
+
+    volumes:
+      # SELinux hosts (Fedora, RHEL): write ./data:/data:z
+      - ./data:/data
+
+    environment:
+      # the app stamps its workbooks with the local time - set your zone in .env (e.g. TZ=Europe/Budapest)
+      TZ: ${TZ:-UTC}
+
+    # The container needs root only for the first moments of docker/entrypoint.sh (hand the data folder to the app user,
+    # then drop to it). Everything else is switched off.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
