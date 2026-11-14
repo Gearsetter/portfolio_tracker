@@ -1,0 +1,5 @@
+# The dev container image is built with the project root as context (.devcontainer/Dockerfile).
+# Send only what the build needs - never the statements, the database in data/, .venv or .git.
+*
+!requirements.txt
+!requirements-dev.txt

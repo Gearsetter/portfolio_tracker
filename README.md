@@ -24,6 +24,7 @@ Requirements: **Python 3.10 – 3.13**. LibreOffice is optional (see §6).
 | Windows | double‑click `run_app.bat` |
 | macOS / Linux | `./run_app.sh` |
 | any | `pip install -r requirements.txt` then `streamlit run app.py` (or `python app.py`) |
+| VS Code + Docker | *Dev Containers: Reopen in Container*, then **F5** – nothing else to install, see §9 |
 
 The launch scripts create a private virtual environment in `.venv` on the first start, install
 `requirements.txt` and open the app in your browser (`http://localhost:8501`; set `IBKR_TRACKER_PORT` for another
@@ -124,7 +125,9 @@ ibkr_tracker/
   excel/                   builder (workbook), refresh (in-place update / rebuild), overrides, recalc (cached values)
   storage.py, tracker.py   archive + settings (SQLite) and the service layer used by the GUI
 scripts/make_sample_workbook.py   regenerates examples/output/*.xlsx offline from examples/statements
-tests/                     165 tests (pytest)
+tests/                     178 tests (pytest)
+.devcontainer/             VS Code dev container: Dockerfile, devcontainer.json, post-create.sh (see §9)
+.vscode/                   F5 debug configuration, tasks (run the app, tests), recommended extensions
 ```
 
 Data lives in `./data` (`tracker.db`, `output/`); set `IBKR_TRACKER_HOME` to use another folder.
@@ -164,4 +167,38 @@ Highlights: parsing of both formats against the same statement, merge / de‑dup
 hand‑computed ground truth (sells, withdrawal, fee, interest, EUR stock, EUR base, forex commission, USD base),
 cell‑by‑cell comparison of the LibreOffice‑recalculated workbook with the Python numbers, layout/spacing rules of
 the specification, in‑place refresh and override merging, locked files, the GUI (Streamlit `AppTest` and an optional
-real‑browser smoke test) and a check of the totals against IBKR's own *Open Positions*, *Cash Report* and NAV.
+real‑browser smoke test), a check of the totals against IBKR's own *Open Positions*, *Cash Report* and NAV, and
+consistency checks of the dev container configuration (port, build context, line endings, …).
+
+## 9. Development container (VS Code)
+
+`.devcontainer/` is a ready‑made development environment: **Ubuntu 24.04, Python 3.12, LibreOffice Calc 24.2** and all
+Python packages (runtime and `pytest`) – the stack the project is tested with. Nothing has to be installed on your
+computer except Docker and VS Code.
+
+1. Install **Docker** (Docker Desktop on Windows / macOS, Docker Engine on Linux) and the VS Code extension
+   **Dev Containers** (`ms-vscode-remote.remote-containers`; VS Code suggests it when it opens the folder).
+2. Open the project folder in VS Code and run **Dev Containers: Reopen in Container** (Command Palette). The first
+   build creates an image of about 1.5 GB and takes a few minutes; later starts take seconds.
+3. Press **F5** (*Run and Debug → Streamlit: IBKR Portfolio Tracker*): the app starts under the debugger and the
+   browser opens at `http://localhost:8501`. Or type `./run_app.sh` in the VS Code terminal.
+4. **Terminal → Run Task → Tests: all** (or `python -m pytest`) runs the test suite; the *Testing* view lists the tests
+   too. More tasks: *Tests: fast (without the browser test)*, *Sample workbook: rebuild (offline)*.
+
+Good to know
+
+* **Your data stays on your computer.** The project folder is mounted into the container, so `data/` (statement archive,
+  settings, workbooks) is an ordinary folder next to `app.py` and survives *Rebuild Container*. The app listens on
+  `127.0.0.1` inside the container and VS Code forwards port 8501 to *your* computer only – nothing is published on the
+  network. Do not run it in GitHub Codespaces with real statements: that would put your account data on a cloud machine.
+* The Python packages live in `/opt/venv` inside the image, not in the folder, so a `.venv` that `run_app.bat` /
+  `run_app.sh` created next to the project (on Windows or macOS) never gets in the way. In the container `run_app.sh`
+  uses that environment (`IBKR_TRACKER_VENV`) instead of creating `.venv`. After changing `requirements*.txt` run
+  *Dev Containers: Rebuild Container*.
+* **Build options** – `.devcontainer/devcontainer.json` → `build.args`: `INSTALL_LIBREOFFICE` (default `"true"`, about
+  0.5 GB: cached values in the workbook and the tests that recalculate it) and `INSTALL_PLAYWRIGHT` (default `"false"`;
+  `"true"` adds Chromium, about 0.7 GB, for the real‑browser smoke test). Change the value, then *Rebuild Container*.
+* **Windows:** for fast file access keep the project in the WSL 2 file system (for example `\\wsl$\Ubuntu\home\you\…`)
+  and open it from there. `.gitattributes` keeps the shell scripts at LF line endings – a CRLF checkout would break them.
+* The container needs internet access for the Yahoo Finance download (and for the first build); behind a company proxy
+  configure it in Docker Desktop.

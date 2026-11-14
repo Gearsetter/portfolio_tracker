@@ -1,0 +1,39 @@
+{
+  // Run and Debug (F5). Works in the dev container and on a normal installation: it uses the Python interpreter
+  // that is selected in VS Code (in the container: /opt/venv).
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Streamlit: IBKR Portfolio Tracker",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "app.py", "--server.port", "8501"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      // open the browser as soon as Streamlit prints its address (the port is forwarded in the dev container)
+      "serverReadyAction": {
+        "pattern": "URL: https?://[^:\\s]+:([0-9]+)",
+        "uriFormat": "http://localhost:%s",
+        "action": "openExternally"
+      }
+    },
+    {
+      "name": "pytest: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["${file}", "-x", "-q"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: rebuild the sample workbook (offline)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/make_sample_workbook.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}
