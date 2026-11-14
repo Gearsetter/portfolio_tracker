@@ -17,11 +17,13 @@ BASE_LEVELS = {            # symbol -> (level, quote currency)
 class FakeProvider:
     """Deterministic pseudo-random walk on weekdays; records every call for assertions."""
 
-    def __init__(self, fail: tuple[str, ...] = (), levels: dict[str, float] | None = None, last_day: date | None = None):
+    def __init__(self, fail: tuple[str, ...] = (), levels: dict[str, float] | None = None, last_day: date | None = None,
+                 currencies: dict[str, str] | None = None):
         self.calls: list[tuple[str, date, date]] = []
         self.fail = set(fail)
         self.levels = levels or {}
         self.last_day = last_day
+        self.currencies = currencies or {}             # symbol -> quote currency (default: USD, like most test symbols)
 
     def history(self, symbol: str, start: date, end: date, include_intraday: bool = False) -> SeriesResult:
         self.calls.append((symbol, start, end))
@@ -29,6 +31,7 @@ class FakeProvider:
             raise ProviderError(f"{symbol}: simulated outage")
         level, ccy = BASE_LEVELS.get(symbol, (self.levels.get(symbol, 100.0), "USD"))
         level = self.levels.get(symbol, level)
+        ccy = self.currencies.get(symbol, ccy)
         seed = zlib.crc32(symbol.encode()) % 997
         rows = []
         d = start

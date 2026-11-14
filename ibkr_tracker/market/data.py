@@ -21,6 +21,55 @@ class PricePoint:
     symbol: str = ""
 
 
+SRC_MANUAL = "manual"            # typed / pasted / uploaded price history (highest priority)
+SRC_YAHOO = "yahoo"              # downloaded and cached daily closes
+SRC_STATEMENT = "statement"      # closing prices printed in the IBKR statements (period ends only)
+SOURCE_LABEL = {SRC_MANUAL: "Manual price history", SRC_YAHOO: "Yahoo Finance", SRC_STATEMENT: "IBKR statement"}
+
+
+@dataclass
+class PriceSeries:
+    """Daily closes of one stock in its trading currency, merged from every source (priority per day: manual price
+    history > Yahoo Finance > statement).  Prices are split-adjusted, like Yahoo's ``Close``."""
+    dates: list[date] = field(default_factory=list)
+    closes: list[float] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)            # SRC_* of every point
+    symbol: str = ""
+
+    def __len__(self) -> int:
+        return len(self.dates)
+
+    def asof(self, d: date) -> Optional[tuple[date, float, str]]:
+        """``(day, close, source)`` of the last point on or before ``d``; ``None`` before the first point."""
+        i = bisect_right(self.dates, d) - 1
+        if i < 0:
+            return None
+        return self.dates[i], self.closes[i], self.sources[i]
+
+    @property
+    def first(self) -> Optional[date]:
+        return self.dates[0] if self.dates else None
+
+    @property
+    def last(self) -> Optional[date]:
+        return self.dates[-1] if self.dates else None
+
+    def count(self, source: str) -> int:
+        return sum(1 for s in self.sources if s == source)
+
+
+def merge_series(layers: list[tuple[str, list[tuple[date, float]]]], symbol: str = "") -> PriceSeries:
+    """Combine price layers - ``[(SRC_*, [(day, close), ...]), ...]`` with the **highest priority first** - into one
+    series: on a day that several layers cover, the first layer wins."""
+    chosen: dict[date, tuple[float, str]] = {}
+    for source, rows in layers:
+        for d, v in rows:
+            if d not in chosen:
+                chosen[d] = (float(v), source)
+    days = sorted(chosen)
+    return PriceSeries(days, [chosen[d][0] for d in days], [chosen[d][1] for d in days], symbol)
+
+
 @dataclass
 class FxSeries:
     dates: list[date]
@@ -110,6 +159,9 @@ class MarketData:
     missing_fx: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     last_refresh: str = ""
+    # full daily history of every stock ("TICKER|CCY" -> merged series); feeds the day-by-day reconstruction
+    price_series: dict[str, PriceSeries] = field(default_factory=dict)
+    manual_keys: list[str] = field(default_factory=list)        # stocks that have a manual price history
 
     # ---- accessors ---------------------------------------------------------------------------------------
     def price(self, ticker: str, ccy: str) -> Optional[float]:

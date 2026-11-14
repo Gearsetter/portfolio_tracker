@@ -17,10 +17,12 @@ PORTFOLIO = "Portfolio"
 PRICES = "Prices"
 FXSHEET = "FX"
 BENCH = "Benchmark"
+HISTORY = "History"                   # day-by-day reconstruction of the whole lifespan (values + charts)
 CHECKS = "Checks"
 ABOUT = "About"
 
 GAP = 5                     # empty rows between stacked sections
+HIST_HDR = 24               # History sheet: header row of the daily table (charts above, data from the next row)
 
 # --- Portfolio sheet column letters ---------------------------------------------------------------------
 TRADE_COLS = dict(name="A", ticker="B", qty="C", price="D", total="E", fee="F", ccy="G", date="H")

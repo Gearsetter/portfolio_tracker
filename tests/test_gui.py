@@ -76,10 +76,17 @@ def test_dashboard_for_the_imported_account(gui):
     at = new_app().run()
     assert not at.exception, [e.value for e in at.exception]
     labels = [t.label for t in at.tabs]                                               # nested tabs are listed too
-    assert [x for x in labels if not x[0].isdigit()] == ["Dashboard", "Transactions", "Reconciliation", "Market data",
-                                                         "Archive", "Excel export"]
+    assert labels[0] == "Dashboard"
+    top = [x for x in labels if x in {"Dashboard", "Transactions", "Reconciliation", "Market data", "Archive",
+                                      "Excel export"}]
+    assert top == ["Dashboard", "Transactions", "Reconciliation", "Market data", "Archive", "Excel export"]
     assert [x for x in labels if x[0].isdigit()] == ["1 · Stock transactions (+ 5 · extensions)", "2 · Dividends",
                                                      "3 · Deposits & withdrawals", "4 · Forex"]
+    assert labels[labels.index("Dashboard") + 1:labels.index("Transactions")] == [
+        "Value & deposits", "Gain", "Return", "CAGR", "vs. VUAA", "Allocation"]               # the history charts
+    assert labels[labels.index("Market data") + 1:labels.index("Archive")] == [
+        "Prices & overrides", "Ticker mapping", "Manual price history", "Paste text", "Upload a file", "Type rows",
+        "Price coverage"]
     k = kpis(at)
     assert k["Total value (USD)"] == "9,641.10 USD" and k["Net deposits (HUF)"] == "2,800,000 HUF"
     assert k["Return (HUF)"].endswith("x") and k["CAGR (USD)"].endswith("%") and k["Stocks (USD)"] == "9,608.62 USD"
@@ -188,6 +195,247 @@ def test_export_tab_buttons(gui):
     next(b for b in at.button if b.key == "export_now").click().run()
     assert not at.exception and (home / "output" / f"IBKR_Portfolio_{ACCOUNT}.xlsx").exists()
     assert any("The workbook is up to date" in s.value for s in at.success)
+
+
+# ---- performance history -------------------------------------------------------------------------------------
+def charts(at: AppTest):
+    return at.get("vega_lite_chart")
+
+
+def captions(at: AppTest) -> str:
+    return " ".join(texts(at.caption))
+
+
+def test_history_charts_cover_the_lifespan_before_any_refresh(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    assert not at.exception, [e.value for e in at.exception]
+    days = (date(2026, 10, 23) - date(2026, 1, 14)).days + 1                       # first transaction -> statement date
+    assert (f"Rebuilt day by day from the first transaction (2026-01-14) to the valuation date (2026-10-23) - "
+            f"{days:,} days") in captions(at)
+    assert len(charts(at)) >= 5 and not any("differs from the headline" in w.value for w in at.warning)
+    assert any(n.value.startswith("No daily prices have been downloaded yet") for n in at.warning)   # one clear note
+    assert sum("Days without any price" in w.value for w in at.warning) == 0
+    assert "⬇  Download the daily history (CSV)" in [b.proto.label for b in at.get("download_button")]
+
+
+def test_history_follows_a_refresh_and_gains_the_benchmark_chart(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    before = len(charts(at))
+    sidebar_widget(at, "button", "refresh").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert "to the valuation date (2026-10-30)" in captions(at)
+    assert len(charts(at)) > before                                                  # the "vs. VUAA" tab has charts now
+    assert not any(w.value.startswith("No daily prices have been downloaded yet") for w in at.warning)
+    assert not any("differs from the headline" in w.value for w in at.warning)
+    h = t.snapshot(ACCOUNT).history()
+    assert h.start == date(2026, 1, 14) and h.end == date(2026, 10, 30) and h.matches(t.snapshot(ACCOUNT).metrics) == []
+
+
+def test_the_chart_controls_rerun_cleanly(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    sidebar_widget(at, "button", "refresh").click().run()
+    unit = next(r for r in at.radio if r.key == "hist_unit")
+    period = next(r for r in at.radio if r.key == "hist_period")
+    assert unit.options == ["HUF", "USD"] and period.options == ["All", "1Y", "YTD", "6M", "3M", "1M"]
+    for u in ("USD", "HUF"):
+        next(r for r in at.radio if r.key == "hist_unit").set_value(u).run()
+        for per in ("1M", "YTD", "3M", "All"):
+            next(r for r in at.radio if r.key == "hist_period").set_value(per).run()
+            assert not at.exception, (u, per, [e.value for e in at.exception])
+    assert kpis(at)["Total value (USD)"] != "9,641.10 USD"                             # the headline is not affected
+
+
+def test_the_history_does_not_depend_on_the_view_filter(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    sidebar_widget(at, "button", "refresh").click().run()
+    on = t.snapshot(ACCOUNT, dict(t.settings(), hide_closed_dust=True)).history().frame
+    sidebar_widget(at, "toggle", "w_hide").set_value(False).run()
+    assert not at.exception
+    off = t.snapshot(ACCOUNT, dict(t.settings(), hide_closed_dust=False)).history().frame
+    assert on.equals(off)
+
+
+# ---- manual price history -------------------------------------------------------------------------------------
+def widget(at: AppTest, kind: str, key: str):
+    return next(w for w in getattr(at, kind) if w.key == key)
+
+
+def paste(at: AppTest, stock: str, text: str, nonce: int = 0) -> AppTest:
+    widget(at, "selectbox", "mp_target").set_value(stock).run()
+    return widget(at, "text_area", f"mp_text_{nonce}").set_value(text).run()
+
+
+def test_pasted_prices_are_saved_and_used_at_once(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    stocks_before = kpis(at)["Stocks (USD)"]
+    at = paste(at, "MSFT (USD)", "Date;Price\n2026-10-28;500,25\n2026-10-29;501,75\n")
+    assert not at.exception, [e.value for e in at.exception]
+    assert any(s.value.startswith("2 price(s) from 2026-10-28 to 2026-10-29") for s in at.success)
+    assert t.manual_prices("MSFT|USD") == []                                         # nothing is saved before the button
+    widget(at, "button", "mp_save").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert t.manual_prices("MSFT|USD") == [(date(2026, 10, 28), 500.25), (date(2026, 10, 29), 501.75)]
+    assert any("2 manual price(s) saved for MSFT (USD)" in s.value for s in at.success)
+    snap = t.snapshot(ACCOUNT)
+    assert snap.md.price("MSFT", "USD") == 501.75 and snap.md.as_of == date(2026, 10, 29)
+    assert kpis(at)["Stocks (USD)"] == f"{snap.metrics.stocks_usd:,.2f} USD" != stocks_before
+    assert "Valuation date 2026-10-29" in captions(at)
+    assert not any("differs from the headline" in w.value for w in at.warning)
+    assert (home / "output" / f"IBKR_Portfolio_{ACCOUNT}.xlsx").exists()                # the workbook follows
+    again = new_app().run()                                                          # a new session: still valued so
+    assert kpis(again)["Stocks (USD)"] == kpis(at)["Stocks (USD)"]
+    widget(again, "selectbox", "mp_target").set_value("MSFT (USD)").run()
+    assert "Saved manual prices of MSFT (USD) (2)" in [e.label for e in again.expander]
+
+
+def test_a_paste_with_unusable_lines_needs_a_confirmation(gui):
+    t, fake, home = gui
+    at = paste(new_app().run(), "MSFT (USD)", "2026-10-28,500.25\nnonsense\n2026-10-29,501.75\n")
+    assert not at.exception
+    assert widget(at, "button", "mp_save").disabled                                   # not until the user agrees
+    assert any("Skip the 1 unusable line(s) and save the rest" in c.label for c in at.checkbox)
+    widget(at, "checkbox", "mp_skip_0").check().run()
+    assert not widget(at, "button", "mp_save").disabled
+    widget(at, "button", "mp_save").click().run()
+    assert [d for d, _ in t.manual_prices("MSFT|USD")] == [date(2026, 10, 28), date(2026, 10, 29)]
+
+
+def test_a_paste_that_cannot_be_read_saves_nothing(gui):
+    t, fake, home = gui
+    at = paste(new_app().run(), "MSFT (USD)", "nothing\nuseful\nhere\n")
+    assert not at.exception and any("Expected two columns" in e.value for e in at.error)
+    assert not any(b.key == "mp_save" for b in at.button) and t.manual_prices("MSFT|USD") == []
+    at = paste(at, "MSFT (USD)", "Date,Price\n")                                       # a header and nothing else
+    assert any("Only a header line" in e.value for e in at.error) and t.manual_prices("MSFT|USD") == []
+    at = paste(at, "MSFT (USD)", "2026-13-45,10\n2026-14-45,11\n")                   # the right shape, no valid day
+    assert any("No valid price rows were found." in e.value for e in at.error)
+    assert not any(b.key == "mp_save" for b in at.button) and t.manual_prices("MSFT|USD") == []
+
+
+def test_prices_can_be_added_replaced_and_deleted(gui):
+    t, fake, home = gui
+    t.save_manual_prices("MSFT|USD", [(date(2026, 10, 1), 1.0), (date(2026, 10, 2), 2.0)])
+    at = paste(new_app().run(), "MSFT (USD)", "2026-10-02,22\n2026-10-03,33\n")
+    widget(at, "button", "mp_save").click().run()                                    # default mode: add / overwrite days
+    assert t.manual_prices("MSFT|USD") == [(date(2026, 10, 1), 1.0), (date(2026, 10, 2), 22.0), (date(2026, 10, 3), 33.0)]
+    at = paste(at, "MSFT (USD)", "2026-10-05,55\n", nonce=1)
+    widget(at, "radio", "mp_mode_1").set_value("Replace all manual prices of this stock").run()
+    widget(at, "button", "mp_save").click().run()
+    assert t.manual_prices("MSFT|USD") == [(date(2026, 10, 5), 55.0)]
+    at = widget(at, "selectbox", "mp_target").set_value("MSFT (USD)").run()
+    assert widget(at, "button", "mp_delete").disabled
+    widget(at, "checkbox", "mp_sure_2").check().run()
+    widget(at, "button", "mp_delete").click().run()
+    assert not at.exception and t.manual_prices("MSFT|USD") == []
+    assert any("1 manual price(s) of MSFT (USD) deleted." in i.value for i in at.info)
+
+
+def test_the_benchmark_gets_its_own_manual_history(gui):
+    t, fake, home = gui
+    target = next(o for o in widget(new_app().run(), "selectbox", "mp_target").options if o.startswith("Benchmark"))
+    at = paste(new_app().run(), target, "2026-01-14,500\n2026-10-23,600\n")
+    widget(at, "button", "mp_save").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    from ibkr_tracker.market.manual import BENCHMARK_KEY
+    assert t.manual_prices(BENCHMARK_KEY) == [(date(2026, 1, 14), 500.0), (date(2026, 10, 23), 600.0)]
+    snap = t.snapshot(ACCOUNT)
+    assert snap.metrics.benchmark.available and snap.history().benchmark_available
+
+
+# ---- ticker mapping -------------------------------------------------------------------------------------------
+def edit_mapping(at: AppTest, t: Tracker, ticker: str, alias=None, manual=None, nonce: int = 0) -> AppTest:
+    rows = t.mapping_rows(t.portfolio(ACCOUNT))
+    idx = next(i for i, r in enumerate(rows) if r.ticker == ticker)
+    change = {}
+    if alias is not None:
+        change["Your symbol (alias)"] = alias
+    if manual is not None:
+        change["Manual prices only"] = manual
+    at.session_state[f"map_editor_{nonce}"] = {"edited_rows": {idx: change}, "added_rows": [], "deleted_rows": []}
+    return at.run()
+
+
+def test_the_mapping_tab_opens_with_every_stock_on_its_automatic_symbol(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    assert not at.exception
+    rows = t.mapping_rows(t.portfolio(ACCOUNT))
+    assert [r.ticker for r in rows] == ["AMZN", "BN", "GOOGL", "META", "MSFT", "NVO"]
+    assert all(r.symbol == r.ticker and r.source == "automatic" for r in rows)
+    assert widget(at, "checkbox", "map_download").value is True and not widget(at, "button", "map_test").disabled
+    assert "⬇  Download ticker_mapping.csv" in [b.proto.label for b in at.get("download_button")]
+
+
+def test_saving_an_alias_downloads_only_that_symbol_and_persists(gui):
+    t, fake, home = gui
+    at = edit_mapping(new_app().run(), t, "NVO", alias="nvo.mx")
+    assert not at.exception, [e.value for e in at.exception]
+    widget(at, "button", "map_save").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert t.settings()["yahoo_symbols"] == {"NVO|USD": "NVO.MX"} and [c[0] for c in fake.calls] == ["NVO.MX"]
+    assert any("Mapping saved (1 stock(s) changed)." in s.value for s in at.success)
+    st.cache_resource.clear()                                                         # "restart the app"
+    again = new_app().run()
+    assert next(r for r in Tracker(Store(home / "tracker.db")).mapping_rows(
+        Tracker(Store(home / "tracker.db")).portfolio(ACCOUNT)) if r.ticker == "NVO").symbol == "NVO.MX"
+    assert not again.exception
+
+
+def test_the_download_can_be_postponed(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    widget(at, "checkbox", "map_download").uncheck().run()
+    at = edit_mapping(at, t, "NVO", alias="NVO.MX")
+    widget(at, "button", "map_save").click().run()
+    assert t.settings()["yahoo_symbols"] == {"NVO|USD": "NVO.MX"} and fake.calls == []
+
+
+def test_an_invalid_alias_is_refused_in_the_page(gui):
+    t, fake, home = gui
+    at = edit_mapping(new_app().run(), t, "NVO", alias="NVO MX")
+    widget(at, "button", "map_save").click().run()
+    assert not at.exception and t.settings()["yahoo_symbols"] == {} and fake.calls == []
+    reported = texts(at.error) + texts(at.warning) + texts(at.success) + texts(at.info)
+    assert any("NVO: 'NVO MX' rejected - a symbol must not contain blanks" in x for x in reported), reported
+
+
+def test_a_stock_can_be_set_to_manual_prices_only(gui):
+    t, fake, home = gui
+    at = edit_mapping(new_app().run(), t, "NVO", manual=True)
+    widget(at, "button", "map_save").click().run()
+    assert not at.exception and t.settings()["manual_only"] == ["NVO|USD"]
+    sidebar_widget(at, "button", "refresh").click().run()
+    assert "NVO" not in [c[0] for c in fake.calls]                                    # never downloaded
+
+
+def test_testing_a_symbol_and_using_it(gui):
+    t, fake, home = gui
+    at = new_app().run()
+    widget(at, "selectbox", "map_test_stock").set_value("NVO (USD)").run()
+    widget(at, "text_input", "map_test_symbol").set_value("nvo.mx").run()
+    widget(at, "button", "map_test").click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    assert any(s.value.startswith("NVO.MX: last close") and s.value.endswith("Fake NVO.MX") for s in at.success)
+    assert t.settings()["yahoo_symbols"] == {}                                        # testing saves nothing
+    widget(at, "button", "map_use").click().run()
+    assert not at.exception and t.settings()["yahoo_symbols"] == {"NVO|USD": "NVO.MX"}
+    bad = new_app().run()
+    widget(bad, "text_input", "map_test_symbol").set_value("NVO MX").run()
+    widget(bad, "button", "map_test").click().run()
+    assert any(e.value.startswith("Not a valid symbol") for e in bad.error)
+
+
+def test_symbol_testing_is_off_in_the_offline_mode(gui):
+    t, fake, home = gui
+    t.update_settings(price_source="statement")
+    at = new_app().run()
+    assert widget(at, "button", "map_test").disabled and widget(at, "checkbox", "map_download").disabled
+    assert "Offline mode (statements only) is on - symbols cannot be tested." in captions(at)
 
 
 # ======================================================================================================

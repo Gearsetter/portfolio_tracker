@@ -70,7 +70,7 @@ def formulas(wb):
 # structure required by the task
 # ======================================================================================================
 def test_sheets(wb):
-    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "Checks", "About", "_state"]
+    assert wb.sheetnames == ["Portfolio", "Prices", "FX", "Benchmark", "History", "Checks", "About", "_state"]
     assert wb["_state"].sheet_state == "hidden" and wb.active.title == "Portfolio"
     assert wb.calculation.fullCalcOnLoad is True
     assert wb.properties.title == "IBKR portfolio U24013787"

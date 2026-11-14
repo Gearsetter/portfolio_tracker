@@ -52,7 +52,8 @@ def _decimal_comma(df: pd.DataFrame) -> pd.DataFrame:
 def csv_tables(snap: Snapshot) -> dict[str, pd.DataFrame]:
     """``{file name: table}`` - empty tables are left out.  With the view filter on (closed positions with zero
     shares, cash balances below 0.5) ``positions.csv`` and ``cash.csv`` do not list them; the transaction tables are
-    history and always complete, and so are the totals in ``summary.csv``."""
+    history and always complete, and so are the totals in ``summary.csv``.  ``history.csv`` is the day-by-day
+    reconstruction of the whole lifespan (:mod:`ibkr_tracker.history`) - always complete as well."""
     m, p = snap.metrics, snap.portfolio
     if m is None:
         return {}
@@ -67,11 +68,24 @@ def csv_tables(snap: Snapshot) -> dict[str, pd.DataFrame]:
         "deposits_withdrawals.csv": T.deposits_table(m, acct),
         "forex.csv": T.forex_table(p, acct),
     }
+    hist = snap.history()
+    if hist is not None and not hist.empty:
+        tables["history.csv"] = T.history_table(hist)          # day by day, first transaction -> valuation date
     if acct:
         tables["accounts.csv"] = T.accounts_table(snap.accounts)
     if snap.checks:
         tables["checks.csv"] = T.checks_table(snap.checks)
     return {name: df for name, df in tables.items() if len(df)}
+
+
+def history_csv(snap: Snapshot, style: Optional[str] = None) -> Optional[bytes]:
+    """``history.csv`` alone (the dashboard's download button); ``None`` when there is no history."""
+    hist = snap.history()
+    if hist is None or hist.empty:
+        return None
+    style = csv_style(snap.settings, style)
+    df = T.history_table(hist)
+    return (_decimal_comma(df) if style == "european" else df).to_csv(index=False, **CSV_STYLES[style]).encode("utf-8-sig")
 
 
 def csv_files(snap: Snapshot, style: Optional[str] = None) -> dict[str, bytes]:

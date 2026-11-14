@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS prices(
 CREATE TABLE IF NOT EXISTS price_meta(
     symbol TEXT PRIMARY KEY, currency TEXT, name TEXT, fetched_at TEXT, last_error TEXT
 );
+CREATE TABLE IF NOT EXISTS manual_prices(
+    key TEXT NOT NULL, day TEXT NOT NULL, price REAL NOT NULL, source TEXT, imported_at TEXT,
+    PRIMARY KEY(key, day)
+);
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS snapshots(
     account TEXT NOT NULL, as_of TEXT NOT NULL, taken_at TEXT NOT NULL,
@@ -187,6 +191,47 @@ class Store:
             row = c.execute("SELECT currency, name, fetched_at, last_error FROM price_meta WHERE symbol=?",
                             (symbol,)).fetchone()
         return dict(row) if row else {}
+
+    # ---- manual price history (typed / pasted / uploaded by the user - NOT part of the downloaded cache) ----------
+    def save_manual_prices(self, key: str, rows: Sequence[tuple[date, float]], source: str = "",
+                           replace: bool = False) -> int:
+        """Store ``(day, price)`` rows of ``key`` (``"TICKER|CCY"``).  A day that is already there is overwritten;
+        with ``replace`` the whole series of ``key`` is replaced instead.  Returns the number of rows written."""
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as c:
+            if replace:
+                c.execute("DELETE FROM manual_prices WHERE key=?", (key,))
+            c.executemany(
+                "INSERT INTO manual_prices(key, day, price, source, imported_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(key, day) DO UPDATE SET price=excluded.price, source=excluded.source, "
+                "imported_at=excluded.imported_at",
+                [(key, d.isoformat(), float(v), source, stamp) for d, v in rows])
+        return len(rows)
+
+    def get_manual_prices(self, key: str) -> list[tuple[date, float]]:
+        with self._conn() as c:
+            rows = c.execute("SELECT day, price FROM manual_prices WHERE key=? ORDER BY day", (key,)).fetchall()
+        return [(date.fromisoformat(r["day"]), float(r["price"])) for r in rows]
+
+    def manual_price_summary(self) -> dict[str, dict]:
+        """``{key: {count, first, last, source, imported_at}}`` for every key that has manual prices."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT key, COUNT(*) AS n, MIN(day) AS first, MAX(day) AS last, MAX(source) AS source, "
+                "MAX(imported_at) AS imported_at FROM manual_prices GROUP BY key ORDER BY key").fetchall()
+        return {r["key"]: {"count": r["n"], "first": date.fromisoformat(r["first"]),
+                           "last": date.fromisoformat(r["last"]), "source": r["source"] or "",
+                           "imported_at": r["imported_at"] or ""} for r in rows}
+
+    def delete_manual_prices(self, key: str, days: Optional[Sequence[date]] = None) -> int:
+        """Remove the manual prices of ``key`` - all of them, or only those on ``days``.  Returns the row count."""
+        with self._conn() as c:
+            if days is None:
+                cur = c.execute("DELETE FROM manual_prices WHERE key=?", (key,))
+            else:
+                cur = c.executemany("DELETE FROM manual_prices WHERE key=? AND day=?",
+                                    [(key, d.isoformat()) for d in days])
+            return cur.rowcount
 
     # ---- history of portfolio values (one row per valuation date, replaced when recomputed) -----------------
     def save_snapshot(self, account: str, as_of: date, values: dict) -> None:

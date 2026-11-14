@@ -7,10 +7,13 @@ Everything that can be a formula *is* a formula; the only hard-coded numbers are
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime, time
 from typing import Optional
 
 from openpyxl import Workbook
+from openpyxl.chart import LineChart, Reference
+from openpyxl.chart.axis import DateAxis
 from openpyxl.comments import Comment
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -21,7 +24,10 @@ from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .. import __version__
+from .. import tables as T
 from ..config import hide_closed_dust
+from ..history import COLUMNS as HISTORY_COLUMNS
+from ..history import History, build_history
 from ..market.data import MarketData
 from ..portfolio import QTY_TOL, SRC_TRANSACTIONS, Portfolio
 from ..reconcile import NAV_REL_TOL, SHARE_CHECK, cash_tolerance
@@ -159,6 +165,7 @@ def build_workbook(portfolio: Portfolio, md: MarketData, settings: dict, generat
     wsp = wb.create_sheet(L.PRICES)
     wsf = wb.create_sheet(L.FXSHEET)
     wsb = wb.create_sheet(L.BENCH)
+    wsh = wb.create_sheet(L.HISTORY)
     wsc = wb.create_sheet(L.CHECKS)
     wsa = wb.create_sheet(L.ABOUT)
     for sheet in wb.worksheets:
@@ -168,9 +175,11 @@ def build_workbook(portfolio: Portfolio, md: MarketData, settings: dict, generat
     _write_prices(wsp, portfolio, md, settings, lay, base, positions, currencies, fx_cols, generated_at)
     _write_fx(wsf, md, fx_cols, wb)
     _write_bench(wsb, md, wb)
+    hist = build_history(portfolio, md, days_per_year=float(settings.get("days_per_year") or 365))
+    _write_history(wsh, portfolio, md, hist)
     _write_portfolio(ws, wb, portfolio, md, lay, base, positions, currencies, hide)
     _write_checks(wsc, portfolio, md, lay, positions, currencies, base, hide)
-    _write_about(wsa, portfolio, md, lay, base, generated_at, hide)
+    _write_about(wsa, portfolio, md, lay, base, generated_at, hide, hist.notes)
     _define_names(wb, lay, positions, currencies, fx_cols)
     write_state(wb, portfolio, md, settings)
 
@@ -513,7 +522,7 @@ def _write_prices(ws: Worksheet, p: Portfolio, md: MarketData, settings: dict, l
         _put(ws, f"D{r}", md.yahoo_symbols.get(key, ticker), font=F_INPUT)
         _put(ws, f"E{r}", pt.price if pt else None, FMT_PRICE, F_INPUT)
         _put(ws, f"F{r}", _dt(pt.day) if pt else None, FMT_DATE, F_INPUT)
-        _put(ws, f"G{r}", pt.source if pt else "MISSING - refresh or enter an override",
+        _put(ws, f"G{r}", pt.source if pt else "MISSING - refresh, add manual prices or enter an override",
              font=F_INPUT if pt else F_WARN)
         _put(ws, f"H{r}", md.price_overrides.get(key), FMT_PRICE, F_INPUT, FILL_IN)
         _put(ws, f"I{r}", f'=IF(H{r}<>"",H{r},E{r})', FMT_PRICE)
@@ -586,6 +595,102 @@ def _write_bench(ws: Worksheet, md: MarketData, wb: Workbook) -> None:
     ws.freeze_panes = "A2"
     ws.sheet_properties.tabColor = "2E75B6"
     _print_setup(ws, landscape=False, title_rows="1:1")
+
+
+# ======================================================================================================
+# History: the day-by-day reconstruction (values written by the app) with charts
+# ======================================================================================================
+_HIST_FMT = {"USD": FMT_MONEY, "base": FMT_MONEY, "x": FMT_RATIO, "fraction": FMT_PCT, "rate": "0.0000",
+             "years": FMT_YEARS, "count": "0"}
+
+
+def _clean(v):
+    """A cell value for openpyxl: NaN / inf are not valid in a workbook - leave the cell empty."""
+    if v is None or (isinstance(v, float) and not math.isfinite(v)):
+        return None
+    return v
+
+
+def _line_chart(ws: Worksheet, title: str, y_title: str, cols: list[int], first: int, last: int, anchor: str,
+                y_format: str = "#,##0") -> None:
+    """A line chart of columns ``cols`` (1-based, header in ``HIST_HDR``) against the dates of column A."""
+    ch = LineChart()
+    ch.title = title
+    ch.height, ch.width = 9.0, 17.5
+    ch.y_axis.title = y_title
+    ch.y_axis.number_format = y_format
+    for col in cols:
+        ch.add_data(Reference(ws, min_col=col, min_row=L.HIST_HDR, max_row=last), titles_from_data=True)
+    ch.set_categories(Reference(ws, min_col=1, min_row=first, max_row=last))
+    ch.x_axis = DateAxis(crossAx=100)
+    ch.x_axis.number_format = "yyyy-mm"
+    ch.x_axis.majorTimeUnit = "months"
+    ch.y_axis.crossAx = 500
+    ch.x_axis.delete = False                       # (openpyxl 3.1 hides the axes unless told otherwise)
+    ch.y_axis.delete = False
+    ch.legend.position = "b"
+    for series in ch.series:
+        series.smooth = False
+        series.marker.symbol = "none"
+        series.graphicalProperties.line.width = 19050          # 1.5 pt
+    ws.add_chart(ch, anchor)
+
+
+def _write_history(ws: Worksheet, p: Portfolio, md: MarketData, h: History) -> None:
+    """The *History* sheet: charts on top, one row per calendar day below.  Values, not formulas - the daily series
+    are far too long for formulas; the sheet is rewritten whenever prices are refreshed.  The last row equals the totals
+    of Sections 8 / 9 on the Portfolio sheet (they use the same current prices and rates)."""
+    base = p.base_currency or "HUF"
+    ws.sheet_properties.tabColor = "548235"
+    _put(ws, "A1", "Portfolio history - every day from the first transaction to the valuation date", font=F_TITLE,
+         border=None)
+    if h.empty:
+        _put(ws, "A3", "No history: the imported statements contain no activity.", font=F_WARN, border=None)
+        return
+    note = (f"{h.start} to {h.end} ({h.days} days). Written by the app (values, not formulas) from the transactions, "
+            "the daily price series and the daily FX rates; rewritten by Refresh Prices. Shares and cash follow the "
+            "transactions day by day, prices are carried forward from the last close. The last row equals Sections 8-9. "
+            "CAGR columns stay empty until the average deposit is three months old.")
+    if h.notes:
+        note += f" {len(h.notes)} data-coverage note(s): see the About sheet."
+    _put(ws, "A2", note, font=F_NOTE, border=None)
+
+    df = T.history_table(h)
+    names = T.history_columns(h)
+    units = [HISTORY_COLUMNS[c][1] for c in names] + ["USD"] * len(h.positions.columns)
+    first, last = L.HIST_HDR + 1, L.HIST_HDR + len(df)
+    ws.column_dimensions["A"].width = 12
+    _put(ws, f"A{L.HIST_HDR}", "Date", font=F_BOLD, fill=FILL_HDR, border=B_HDR, align="center")
+    for j, name in enumerate(df.columns[1:], start=2):
+        col = get_column_letter(j)
+        ws.column_dimensions[col].width = 15
+        _put(ws, f"{col}{L.HIST_HDR}", name, font=F_BOLD, fill=FILL_HDR, border=B_HDR, align="center")
+        ws[f"{col}{L.HIST_HDR}"].alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+    ws.row_dimensions[L.HIST_HDR].height = 42
+    formats = [None] + [_HIST_FMT[u] for u in units]
+    values = df.to_numpy(dtype=object)
+    for i in range(len(df)):
+        r = first + i
+        for j in range(values.shape[1]):
+            cell = ws.cell(r, 1 + j, _dt(values[i, j]) if j == 0 else _clean(values[i, j]))
+            cell.number_format = formats[j] if j else FMT_DATE
+            cell.font = F_INPUT
+    ws.auto_filter.ref = f"A{L.HIST_HDR}:{get_column_letter(df.shape[1])}{last}"
+
+    # charts: value against net deposits (base currency) and - when the benchmark is known - stocks against the
+    # benchmark replay (USD), otherwise the return multiple
+    col_of = {n: 2 + i for i, n in enumerate(names)}
+    sfx = "usd" if base == "USD" else "base"                  # a USD portfolio has no separate base-currency columns
+    _line_chart(ws, f"Portfolio value and net deposits ({base})", base,
+                [col_of[f"total_{sfx}"], col_of[f"deposits_{sfx}"]], first, last, "A4")
+    if h.benchmark_available:
+        _line_chart(ws, f"Stocks vs. {h.benchmark_symbol or 'benchmark'} replay of the purchases (USD)", "USD",
+                    [col_of["stocks_usd"], col_of["bench_value_usd"]], first, last, "H4")
+    else:
+        _line_chart(ws, f"Return multiple ({base}): value / net deposits", "x", [col_of[f"return_{sfx}"]], first, last,
+                    "H4", y_format="0.00")
+    ws.sheet_properties.tabColor = "548235"
+    _print_setup(ws, landscape=True, title_rows=f"{L.HIST_HDR}:{L.HIST_HDR}")
 
 
 # ======================================================================================================
@@ -704,7 +809,7 @@ def _write_hidden_block(ws: Worksheet, md: MarketData, p: Portfolio, dust: list[
 
 
 def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base: str, generated_at: datetime,
-                 hide: bool = False) -> None:
+                 hide: bool = False, history_notes: Optional[list[str]] = None) -> None:
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 110
     _put(ws, "A1", "IBKR Portfolio Tracker - about this workbook", font=F_TITLE, border=None)
@@ -775,6 +880,10 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
                          "transaction's quantity into today's shares (used by 'Current Total')."),
         ("VUAA CAGR", "Section 10: every stock transaction replayed into the benchmark ETF; CAGR = (VUAA value / "
                       "invested)^(1/average years since the purchases) - 1, in USD. 'Stocks CAGR' uses the same basis."),
+        ("History sheet", "Day-by-day value of the portfolio from the first transaction to the valuation date, "
+                          "reconstructed by the app (values, not formulas) from the transactions, the daily price series "
+                          "(manual price history > Yahoo Finance > statement closes) and the daily FX rates. The last "
+                          "row equals the totals of Sections 8-9; the charts above the table are redrawn on every refresh."),
     ]
     for k, v in notes:
         _put(ws, f"A{r}", k, font=F_BOLD, border=None)
@@ -782,11 +891,12 @@ def _write_about(ws: Worksheet, p: Portfolio, md: MarketData, lay: Layout, base:
         ws[f"B{r}"].alignment = Alignment(wrap_text=True, vertical="top")
         ws.row_dimensions[r].height = 30 if len(v) > 110 else 16
         r += 1
-    if p.warnings or md.notes:
+    warnings = [*p.warnings, *md.notes, *(history_notes or [])]
+    if warnings:
         r += 1
         _put(ws, f"A{r}", "Warnings", font=F_BOLD, border=None)
         r += 1
-        for w in [*p.warnings, *md.notes]:
+        for w in warnings:
             _put(ws, f"B{r}", w, font=F_WARN, border=None)
             ws[f"B{r}"].alignment = Alignment(wrap_text=True, vertical="top")
             ws.row_dimensions[r].height = 30 if len(w) > 110 else 16
@@ -919,7 +1029,7 @@ def _fresh_sheet(wb: Workbook, title: str) -> Worksheet:
 
 def refresh_market_sheets(wb: Workbook, p: Portfolio, md: MarketData, settings: dict,
                           generated_at: Optional[datetime] = None) -> None:
-    """Update an existing workbook *in place*: only Prices / FX / Benchmark / About (and the hidden state) are
+    """Update an existing workbook *in place*: only Prices / FX / Benchmark / History / About (and the hidden state) are
     rewritten; every formula on Portfolio and Checks is left exactly as it is and recalculates on open."""
     if md.missing_fx:
         raise MissingMarketData("No FX rate available for " + ", ".join(md.missing_fx) + ".")
@@ -935,7 +1045,14 @@ def refresh_market_sheets(wb: Workbook, p: Portfolio, md: MarketData, settings: 
     _write_prices(wsp, p, md, settings, lay, base, positions, currencies, fx_cols, generated_at)
     _write_fx(_fresh_sheet(wb, L.FXSHEET), md, fx_cols, wb)
     _write_bench(_fresh_sheet(wb, L.BENCH), md, wb)
-    _write_about(_fresh_sheet(wb, L.ABOUT), p, md, lay, base, generated_at, hide)
+    hist = build_history(p, md, days_per_year=float(settings.get("days_per_year") or 365))
+    if L.HISTORY in wb.sheetnames:                                   # (a workbook of v1.2 has no History sheet yet)
+        wsh = _fresh_sheet(wb, L.HISTORY)
+    else:
+        wsh = wb.create_sheet(L.HISTORY, wb.sheetnames.index(L.BENCH) + 1)
+        wsh.sheet_view.showGridLines = False
+    _write_history(wsh, p, md, hist)
+    _write_about(_fresh_sheet(wb, L.ABOUT), p, md, lay, base, generated_at, hide, hist.notes)
     _define_names(wb, lay, positions, currencies, fx_cols)
     write_state(wb, p, md, settings)
     wb.calculation.fullCalcOnLoad = True

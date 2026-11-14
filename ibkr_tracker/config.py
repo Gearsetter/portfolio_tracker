@@ -15,6 +15,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "days_per_year": 365,              # used by the time-weighted CAGR
     "recalc_with_libreoffice": True,   # store cached values in the .xlsx when LibreOffice is installed
     "yahoo_symbols": {},               # "TICKER|CCY" -> Yahoo Finance symbol (overrides the automatic mapping)
+    "manual_only": [],                 # "TICKER|CCY" keys that are never downloaded: manual price history only
     "price_overrides": {},             # "TICKER|CCY" -> manual price
     "fx_overrides": {},                # "CCY" -> manual units of CCY per 1 USD
     "benchmark_override": None,        # manual benchmark price in USD

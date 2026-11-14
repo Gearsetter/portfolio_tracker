@@ -1,11 +1,14 @@
 """pandas views of the results (for the GUI).  Column names mirror the spreadsheet headers."""
 from __future__ import annotations
 
+from datetime import date
 from typing import Optional
 
 import pandas as pd
 
 from .calc import Metrics
+from .history import COLUMNS as HISTORY_COLUMNS
+from .history import MIN_CAGR_YEARS, History
 from .portfolio import Portfolio, is_closed
 from .reconcile import CheckRow
 
@@ -113,7 +116,7 @@ def prices_table(md, portfolio: Portfolio, settings: dict) -> pd.DataFrame:
         raw = md.raw_prices.get(key)
         used = md.prices.get(key)
         no_price = ("not needed (position closed)" if is_closed(held.get((ticker, ccy), 0.0))
-                    else "MISSING - refresh or enter an override")          # zero shares are worth nothing, price or not
+                    else "MISSING - refresh, add manual prices or enter an override")          # zero shares are worth nothing, price or not
         rows.append({
             "Ticker": ticker, "Currency": ccy, "Yahoo symbol": md.yahoo_symbols.get(key, ticker),
             "Last close": raw.price if raw else None, "Price date": raw.day if raw else None,
@@ -133,7 +136,7 @@ def fx_status_table(md, portfolio: Portfolio, settings: dict) -> pd.DataFrame:
         over = (settings.get("fx_overrides") or {}).get(ccy)
         rows.append({
             "Currency": ccy, "Last rate (per USD)": raw.price if raw else None, "Rate date": raw.day if raw else None,
-            "Source": raw.source if raw else ("MISSING - refresh or enter an override" if ccy in active
+            "Source": raw.source if raw else ("MISSING - refresh, add manual prices or enter an override" if ccy in active
                                               else "not needed (no activity in this currency)"),
             "Override": _num(over),
             "Rate used": over if over not in (None, "") else (raw.price if raw else None)})
@@ -176,3 +179,124 @@ def summary_table(m: Metrics, p: Portfolio, hide: bool = False) -> pd.DataFrame:
         rows += [("Hidden closed positions", len(h.closed), "positions"),
                  ("Hidden dust cash balances (included in the totals)", h.dust_usd, "USD")]
     return pd.DataFrame(rows, columns=["Item", "Value", "Unit"])
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# day-by-day history (dashboard charts, history.csv, Excel History sheet)
+# ---------------------------------------------------------------------------------------------------------------
+def history_label(column: str, base: str) -> str:
+    """Display name of a history column; ``(base)`` becomes the base currency of the portfolio."""
+    return HISTORY_COLUMNS[column][0].replace("(base)", f"({base})").replace("Base currency per USD", f"{base} per USD")
+
+
+_BASE_ONLY = ("total_base", "deposits_base", "gain_base", "return_base", "cagr_base", "base_per_usd")
+
+
+def history_columns(h: History) -> list[str]:
+    """The frame columns that go into ``history.csv`` and the *History* sheet - a USD-based portfolio has no separate
+    base-currency set (it would repeat the USD columns under the same names)."""
+    skip = _BASE_ONLY if h.base_currency == "USD" else ()
+    return [c for c in h.frame.columns if c not in skip]
+
+
+def history_table(h: History) -> pd.DataFrame:
+    """One row per calendar day with every reconstructed figure (what ``history.csv`` and the Excel *History* sheet
+    hold).  The last columns give the value of every stock in USD.  Annualised figures (CAGR) stay empty until the
+    deposits / purchases are on average :data:`~ibkr_tracker.history.MIN_CAGR_YEARS` (a quarter of a year) old."""
+    if h.empty:
+        return pd.DataFrame()
+    cols = history_columns(h)
+    df = h.frame[cols].copy()
+    for col, years in (("cagr_usd", "years"), ("cagr_base", "years"), ("cagr_stocks", "bench_years"),
+                       ("cagr_bench", "bench_years")):               # annualising a few weeks says nothing: leave empty
+        if col in df:
+            df[col] = df[col].where(h.frame[years] >= MIN_CAGR_YEARS)
+    df.columns = [history_label(c, h.base_currency) for c in df.columns]
+    df.insert(0, "Date", [d.date() for d in df.index])
+    df = df.reset_index(drop=True)
+    for name in h.positions.columns:
+        df[f"{name} (USD)"] = h.positions[name].to_numpy()
+    return df
+
+
+def history_chart_frame(h: History, kind: str, unit: str = "base", since: Optional[date] = None) -> pd.DataFrame:
+    """Data of one dashboard chart: ``kind`` is ``value`` (value vs net deposits), ``gain``, ``return`` (value / net
+    deposits), ``cagr``, ``benchmark`` (stocks vs the benchmark replay, USD), ``benchmark_cagr`` or ``allocation``
+    (stacked value of every stock and the cash).  ``unit``: ``"base"`` (base currency) or ``"usd"``;
+    ``since`` restricts the days.  Annualised figures are left empty while the portfolio is younger than
+    :data:`~ibkr_tracker.history.MIN_CAGR_YEARS` - annualising a few weeks is meaningless."""
+    if h.empty:
+        return pd.DataFrame()
+    f = h.since(since)
+    u = "base" if unit == "base" and h.base_currency != "USD" else "usd"
+    ccy = h.base_currency if u == "base" else "USD"
+    out = pd.DataFrame(index=f.index)
+    if kind == "value":
+        out[f"Portfolio value ({ccy})"] = f[f"total_{u}"]
+        out[f"Net deposits ({ccy})"] = f[f"deposits_{u}"]
+    elif kind == "gain":
+        out[f"Gain ({ccy})"] = f[f"gain_{u}"]
+    elif kind == "return":
+        out[f"Return ({ccy}) - value / net deposits"] = f[f"return_{u}"]
+    elif kind == "cagr":
+        out[f"CAGR ({ccy})"] = f[f"cagr_{u}"].where(f["years"] >= MIN_CAGR_YEARS)
+    elif kind == "benchmark":
+        sym = h.benchmark_symbol or "Benchmark"
+        out["Stocks (USD)"] = f["stocks_usd"]
+        if h.benchmark_available:
+            out[f"{sym} replay (USD)"] = f["bench_value_usd"]                   # (short: the legend must fit)
+    elif kind == "benchmark_cagr":
+        sym = h.benchmark_symbol or "Benchmark"
+        young = f["bench_years"] < MIN_CAGR_YEARS
+        out["Stocks CAGR (USD)"] = f["cagr_stocks"].where(~young)
+        if h.benchmark_available:
+            out[f"{sym} CAGR (USD)"] = f["cagr_bench"].where(~young)
+    elif kind == "allocation":
+        scale = f["base_per_usd"] if u == "base" else 1.0
+        pos = h.positions.loc[f.index]
+        for name in pos.columns:
+            out[name] = pos[name] * scale
+        out["Cash"] = f["cash_usd"] * scale
+    else:
+        raise ValueError(f"unknown chart kind {kind!r}")
+    return out
+
+
+def coverage_table(h: History) -> pd.DataFrame:
+    """How well the price data cover the days every stock was held (the *Market data* tab and the dashboard).
+    The status - the column that matters, and the longest text - comes right after the ticker; dates are text so an
+    empty one is blank instead of a grey "None"."""
+    day = lambda d: d.isoformat() if d else ""                                       # noqa: E731
+    return pd.DataFrame([{
+        "Ticker": c.ticker, "Currency": c.currency, "Status": c.status, "Days held": c.held_days, "Prices": c.points,
+        "Yahoo": c.yahoo_points, "Manual": c.manual_points, "Statement": c.statement_points,
+        "First price": day(c.first_price), "Last price": day(c.last_price)} for c in h.coverage])
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# ticker mapping / manual price history (Market data tab)
+# ---------------------------------------------------------------------------------------------------------------
+def mapping_table(rows) -> pd.DataFrame:
+    """The ticker-mapping editor: IBKR ticker, the automatic Yahoo symbol, the user's alias and the download status.
+    The columns that matter come first - the wide name and the exchange (the source of the automatic symbol) last."""
+    return pd.DataFrame([{
+        "Ticker": r.ticker, "Currency": r.currency, "Held now": r.held, "Automatic symbol": r.auto_symbol,
+        "Your symbol (alias)": r.alias, "Manual prices only": r.manual_only,
+        "Symbol used": "-" if r.manual_only else r.symbol, "Status": ("[!] " if r.problem else "") + r.status,
+        "Name": r.name, "IBKR exchange": r.exchange} for r in rows])
+
+
+def manual_prices_table(portfolio: Portfolio, summary: dict, benchmark_key: str, benchmark_symbol: str = "") -> pd.DataFrame:
+    """Overview of the manual price history of every stock (and of the benchmark)."""
+    held = portfolio.net_quantities()
+    rows = []
+    entries = [(f"{t}|{c}", t, c, "no" if is_closed(held.get((t, c), 0.0)) else "yes")
+               for t, c in portfolio.positions_keys()]
+    entries.append((benchmark_key, benchmark_symbol or "Benchmark", "benchmark", "-"))
+    day = lambda d: d.isoformat() if d else ""                                       # noqa: E731  (text: no grey "None")
+    for key, ticker, ccy, is_held in entries:
+        info = summary.get(key) or {}
+        rows.append({"Ticker": ticker, "Currency": ccy, "Held now": is_held, "Manual prices": info.get("count", 0),
+                     "From": day(info.get("first")), "To": day(info.get("last")), "Source": info.get("source", ""),
+                     "Entered": str(info.get("imported_at", "")).replace("T", " ")[:16]})
+    return pd.DataFrame(rows)

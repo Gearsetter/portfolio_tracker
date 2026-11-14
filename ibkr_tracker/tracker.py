@@ -19,7 +19,10 @@ from .calc import Metrics, compute_metrics
 from .config import hide_closed_dust, output_dir
 from .excel import (MissingMarketData, WorkbookLocked, WorkbookUpdate, find_soffice, open_current, refresh_workbook,
                     sync_overrides)
+from .history import History, build_history
 from .market import MarketData, MarketDataService, RefreshReport
+from .market import manual as manual_prices
+from .market import mapping as ticker_mapping
 from .market.providers import PriceProvider
 from .models import StatementInfo
 from .parsing import parse_statement
@@ -67,6 +70,17 @@ class Snapshot:
     problem: str = ""
     accounts: list[AccountSummary] = field(default_factory=list)            # consolidated view: breakdown
     account_checks: dict[str, list[CheckRow]] = field(default_factory=dict)   # consolidated view: per-account checks
+    _history: Optional[History] = field(default=None, repr=False, compare=False)
+
+    def history(self) -> Optional[History]:
+        """The portfolio reconstructed day by day from its first transaction to the valuation date (see
+        :mod:`ibkr_tracker.history`); computed once per snapshot, ``None`` when the numbers cannot be computed."""
+        if self.metrics is None:
+            return None
+        if self._history is None:
+            self._history = build_history(self.portfolio, self.md, self.metrics,
+                                          float(self.settings.get("days_per_year") or 365))
+        return self._history
 
 
 @dataclass
@@ -81,6 +95,15 @@ class RunOutcome:
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+@dataclass
+class MappingOutcome:
+    """Result of saving / importing the ticker mapping."""
+    changed: list[str] = field(default_factory=list)          # "TICKER|CCY" keys whose symbol or mode changed
+    errors: list[str] = field(default_factory=list)           # edits that were rejected
+    report: Optional[RefreshReport] = None                    # the download of the changed symbols (if requested)
+    messages: list[str] = field(default_factory=list)
 
 
 class Tracker:
@@ -273,7 +296,79 @@ class Tracker:
             base_currency=m.base_currency))
 
     def history(self, account: str) -> list[dict]:
+        """The values recorded at each *Refresh Prices* (legacy).  The dashboard charts the day-by-day
+        reconstruction instead - :meth:`Snapshot.history` - which does not depend on when prices were refreshed."""
         return self.store.snapshots(account)
+
+    # ---- ticker mapping (IBKR ticker -> Yahoo Finance symbol) ---------------------------------------------------
+    def mapping_rows(self, p: Portfolio, settings: Optional[dict] = None) -> list[ticker_mapping.MappingRow]:
+        """One row per stock of ``p``: automatic symbol, the user's alias, manual-only flag and download status."""
+        return ticker_mapping.mapping_rows(self.store, self.service, p, settings or self.settings())
+
+    def save_mapping(self, p: Portfolio, edits: dict[str, tuple[str, bool]], download: bool = True,
+                     progress: Optional[Callable[[int, int, str], None]] = None) -> MappingOutcome:
+        """Persist the alias / manual-only edits (``{"TICKER|CCY": (alias, manual_only)}`` of the shown rows) and - with
+        ``download`` - fetch the prices of the symbols that changed, so the new mapping takes effect at once."""
+        settings = self.settings()
+        change = ticker_mapping.apply_edits(settings, self.mapping_rows(p, settings), edits)
+        return self._store_mapping(p, settings, change, download, progress)
+
+    def import_mapping(self, p: Portfolio, text: str, download: bool = True,
+                       progress: Optional[Callable[[int, int, str], None]] = None) -> MappingOutcome:
+        """Merge a mapping file (``Ticker,Currency,Symbol,Manual only`` CSV) into the saved mapping."""
+        settings = self.settings()
+        entries, problems = ticker_mapping.parse_mapping_csv(text)
+        change = ticker_mapping.merge_import(settings, entries)
+        change.errors = problems
+        return self._store_mapping(p, settings, change, download, progress)
+
+    def _store_mapping(self, p: Portfolio, settings: dict, change: ticker_mapping.MappingChange, download: bool,
+                       progress: Optional[Callable[[int, int, str], None]]) -> MappingOutcome:
+        out = MappingOutcome(changed=list(change.changed), errors=list(change.errors))
+        if change.changed:
+            settings = self.update_settings(yahoo_symbols=change.aliases, manual_only=change.manual_only)
+            out.messages.append(f"Mapping saved ({len(change.changed)} stock(s) changed).")
+        if download and change.changed and settings.get("price_source", "yahoo") == "yahoo":
+            skip = self.service.manual_only(settings)
+            wanted = {self.service.symbol_for(p, settings, t, c) for t, c in p.positions_keys()
+                      if f"{t}|{c}" not in skip and (f"{t}|{c}" in change.changed or t in change.changed)}
+            if wanted:
+                out.report = self.service.refresh(p, settings, progress, only=wanted)
+                out.messages.append(out.report.summary())
+        return out
+
+    def mapping_csv(self) -> str:
+        """The saved mapping (all accounts) as a downloadable file."""
+        return ticker_mapping.mapping_to_csv(self.settings())
+
+    def check_symbol(self, symbol: str, currency: str = "") -> ticker_mapping.SymbolTest:
+        """Ask the price provider about ``symbol`` (the *Test* button of the mapping table)."""
+        return ticker_mapping.check_symbol(self.service.provider, symbol, currency, self.service._today())
+
+    # ---- manual price history ---------------------------------------------------------------------------------
+    @staticmethod
+    def parse_manual_prices(text: str, **options) -> manual_prices.ParsedPrices:
+        """Read pasted ``Date, Price`` text (nothing is saved).  Raises :class:`manual_prices.PriceParseError`."""
+        return manual_prices.parse_prices(text, **options)
+
+    @staticmethod
+    def parse_manual_prices_file(data: bytes, **options) -> manual_prices.ParsedPrices:
+        """Read an uploaded CSV / text file (nothing is saved)."""
+        return manual_prices.parse_price_file(data, **options)
+
+    def save_manual_prices(self, key: str, rows, source: str = "pasted text", replace: bool = False) -> int:
+        """Store the manual prices of ``key`` (``"TICKER|CCY"``, or ``manual_prices.BENCHMARK_KEY``).  Rows of days that
+        already have a manual price overwrite it; with ``replace`` the stock's whole manual history is replaced."""
+        return self.store.save_manual_prices(key, rows, source, replace)
+
+    def manual_prices(self, key: str) -> list[tuple[date, float]]:
+        return self.store.get_manual_prices(key)
+
+    def manual_price_summary(self) -> dict[str, dict]:
+        return self.store.manual_price_summary()
+
+    def delete_manual_prices(self, key: str, days=None) -> int:
+        return self.store.delete_manual_prices(key, days)
 
     # ---- CSV export --------------------------------------------------------------------------------------
     def csv_files(self, snap: Snapshot, style: Optional[str] = None) -> dict[str, bytes]:

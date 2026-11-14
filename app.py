@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -25,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ibkr_tracker import __version__                                   # noqa: E402
 from ibkr_tracker import tables as T                                   # noqa: E402
 from ibkr_tracker.config import hide_closed_dust                       # noqa: E402
-from ibkr_tracker.exports import CSV_STYLE_LABELS, CSV_STYLES, csv_style  # noqa: E402
+from ibkr_tracker.exports import CSV_STYLE_LABELS, CSV_STYLES, csv_style, history_csv  # noqa: E402
+from ibkr_tracker.market.manual import BENCHMARK_KEY, PriceParseError, prices_to_text  # noqa: E402
 from ibkr_tracker.market.symbols import yahoo_symbol                   # noqa: E402
 from ibkr_tracker.portfolio import CONSOLIDATED, CONSOLIDATED_LABEL    # noqa: E402
 from ibkr_tracker.reconcile import overall                             # noqa: E402
@@ -47,6 +48,12 @@ def get_tracker() -> Tracker:
 def stretch() -> dict:
     """``width='stretch'`` on new Streamlit versions, ``use_container_width=True`` on older ones."""
     return {"width": "stretch"} if _NEW_WIDTH_API else {"use_container_width": True}
+
+
+# the price-coverage table: the status text is long - give it room (and the short columns little)
+COVERAGE_COLUMNS = {"Status": st.column_config.TextColumn(width="large"),
+                    "Ticker": st.column_config.TextColumn(width="small"),
+                    "Currency": st.column_config.TextColumn(width="small")}
 
 
 def show_df(df: pd.DataFrame, column_config: Optional[dict] = None, height: Optional[int] = None) -> None:
@@ -344,11 +351,7 @@ def dashboard(snap: Snapshot) -> None:
         if alloc:
             st.bar_chart(pd.DataFrame(alloc), x="Holding", y="USD", horizontal=True, **stretch())
 
-    hist = T.snapshots_table(tracker_history(p.account))
-    if len(hist) >= 2:
-        st.markdown("#### Value history (recorded at each refresh)")
-        st.line_chart(hist.rename(columns={"usd_total": "Total value (USD)", "usd_deposits": "Net deposits (USD)"}),
-                      x="as_of", y=["Total value (USD)", "Net deposits (USD)"], **stretch())
+    performance_history(snap)
 
     source = {"open_positions": "the Open Positions section of the latest statement",
               "open_positions+transactions": "the newest Open Positions section plus the later transactions",
@@ -356,8 +359,97 @@ def dashboard(snap: Snapshot) -> None:
     st.caption(f"Valuation date {md.as_of} · {md.mode}" + (f" · share counts from {source}" if source else ""))
 
 
-def tracker_history(account: str) -> list[dict]:
-    return get_tracker().history(account)
+HISTORY_PERIODS = ["All", "1Y", "YTD", "6M", "3M", "1M"]
+
+
+def period_start(end: date, period: str) -> Optional[date]:
+    """First day of the chart window: ``All`` = the whole lifespan, ``YTD`` = 1 January of the valuation year."""
+    if period == "YTD":
+        return date(end.year, 1, 1)
+    days = {"1Y": 365, "6M": 183, "3M": 91, "1M": 30}.get(period)
+    return end - timedelta(days=days) if days else None
+
+
+def performance_history(snap: Snapshot) -> None:
+    """Charts of the day-by-day reconstruction of the whole lifespan (first transaction -> valuation date)."""
+    h = snap.history()
+    st.markdown("#### Performance since the first transaction")
+    if h is None or h.empty:
+        st.info("There is nothing to chart yet - the statements contain no transactions.")
+        return
+    base = h.base_currency
+    bench = (h.benchmark_symbol or "benchmark").split(".")[0]
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        unit_choice = st.radio("Currency", [base, "USD"] if base != "USD" else ["USD"], horizontal=True,
+                               key="hist_unit", help="The base currency valuation includes the currency effect: each "
+                               "deposit is converted at the rate of its day, the value at the rate of every day.")
+    with c2:
+        period = st.radio("Period", HISTORY_PERIODS, horizontal=True, key="hist_period",
+                          help="Chart window only - the figures themselves always start at the first transaction.")
+    unit = "base" if (unit_choice == base and base != "USD") else "usd"
+    since = period_start(h.end, period)
+    ccy = base if unit == "base" else "USD"
+    st.caption(f"Rebuilt day by day from the first transaction ({h.start}) to the valuation date ({h.end}) - "
+               f"{h.days:,} days - from the transactions, the daily prices and the daily FX rates; it does not depend "
+               "on when prices were refreshed. The last day equals the figures above.")
+    if mismatch := h.matches(snap.metrics):
+        st.warning("The last day of the history differs from the headline figures (" + "; ".join(mismatch) +
+                   ") - a held stock probably has no price at all; see the data coverage below.")
+
+    tabs = st.tabs(["Value & deposits", "Gain", "Return", "CAGR", f"vs. {bench}", "Allocation"])
+    with tabs[0]:
+        st.line_chart(T.history_chart_frame(h, "value", unit, since), height=330, **stretch())
+        st.caption(f"Portfolio value (stocks + cash) against the net money paid in ({ccy}). The gap is the profit; "
+                   "steps in the deposit line are deposits and withdrawals on their day.")
+    with tabs[1]:
+        st.line_chart(T.history_chart_frame(h, "gain", unit, since), height=330, **stretch())
+        st.caption(f"Value minus net deposits ({ccy}).")
+    with tabs[2]:
+        st.line_chart(T.history_chart_frame(h, "return", unit, since), height=330, **stretch())
+        st.caption("Value / net deposits - 1.0 means no profit yet, 1.25 means +25 %.")
+    with tabs[3]:
+        cagr = T.history_chart_frame(h, "cagr", unit, since) * 100
+        cagr.columns = [f"{c} %" for c in cagr.columns]
+        if cagr.dropna(how="all").empty:
+            st.info("The annualised return is shown once the average deposit is three months old.")
+        else:
+            st.line_chart(cagr, height=330, **stretch())
+        st.caption("Return^(1 / years) - 1 with the deposit-weighted average age of the deposits. Annualising a young "
+                   "portfolio exaggerates - the curve starts after three months.")
+    with tabs[4]:
+        if not h.benchmark_available:
+            st.info("The comparison needs benchmark prices: press Refresh Prices (or add a manual price history of "
+                    "the benchmark in the Market data tab).")
+        else:
+            st.line_chart(T.history_chart_frame(h, "benchmark", unit, since), height=300, **stretch())
+            st.caption(f"The stocks against what the same purchases (and sales) would be worth in {h.benchmark_symbol}, "
+                       "replayed day by day in USD.")
+            bcagr = T.history_chart_frame(h, "benchmark_cagr", unit, since) * 100
+            bcagr.columns = [f"{c} %" for c in bcagr.columns]
+            if not bcagr.dropna(how="all").empty:
+                st.line_chart(bcagr, height=260, **stretch())
+    with tabs[5]:
+        st.area_chart(T.history_chart_frame(h, "allocation", unit, since), height=330, **stretch())
+        st.caption(f"What the portfolio consisted of, every day ({ccy}).")
+
+    cov = T.coverage_table(h)
+    with st.expander(f"Data coverage of the history - {len(h.notes)} note(s)" if h.notes else
+                     "Data coverage of the history", expanded=bool(h.notes)):
+        for note in h.notes:
+            st.warning(note)
+        if len(cov):
+            show_df(cov, column_config=COVERAGE_COLUMNS)
+        if not h.notes:
+            st.caption("Every day of every position is valued with a real price.")
+        else:
+            st.caption("Missing prices can be added under Market data > Manual price history; a stock Yahoo "
+                       "does not know can get its own symbol under Market data > Ticker mapping.")
+    data = history_csv(snap)
+    if data:
+        st.download_button("⬇  Download the daily history (CSV)", data=data,
+                           file_name=f"IBKR_Portfolio_{snap.portfolio.account}_history.csv", mime="text/csv",
+                           key="download_history_csv")
 
 
 # ======================================================================================================
@@ -442,6 +534,16 @@ def reconciliation(snap: Snapshot) -> None:
             st.info(n)
 
 
+def progress_bar(label: str):
+    """A progress bar and the callback the downloader reports to."""
+    bar = st.progress(0.0, text=label)
+
+    def callback(i: int, n: int, sym: str) -> None:
+        bar.progress(min(1.0, i / max(n, 1)), text=f"Downloading {sym} ..." if sym else "Done")
+
+    return bar, callback
+
+
 def market_data(tracker: Tracker, snap: Snapshot) -> None:
     p, md, s = snap.portfolio, snap.md, snap.settings
     st.caption(f"Mode: {md.mode} · valuation date {md.as_of}")
@@ -451,19 +553,48 @@ def market_data(tracker: Tracker, snap: Snapshot) -> None:
     if errors:
         with st.expander(f"Last refresh: {len(errors)} symbol(s) could not be downloaded"):
             show_df(pd.DataFrame({"Symbol": list(errors), "Problem": list(errors.values())}))
-            st.caption("The cached price, or the closing price printed in the statement, is used for these symbols.")
+            st.caption("The cached price, the manual price history or the closing price printed in the statement is "
+                       "used for these symbols. A symbol Yahoo does not know under this name can be corrected in the "
+                       "Ticker mapping tab; a stock it does not know at all gets its prices in Manual price history.")
 
+    t_px, t_map, t_manual, t_cov = st.tabs(["Prices & overrides", "Ticker mapping", "Manual price history",
+                                            "Price coverage"])
+    with t_px:
+        prices_overrides(tracker, snap)
+    with t_map:
+        ticker_mapping(tracker, snap)
+    with t_manual:
+        manual_price_history(tracker, snap)
+    with t_cov:
+        price_coverage(snap)
+
+    with st.expander("Maintenance"):
+        if st.button("Clear the downloaded price cache", key="clear_cache"):
+            tracker.store.clear_market_cache()
+            flash("info", "Market-data cache cleared. Press Refresh Prices to download it again. Your ticker mapping "
+                          "and manual prices were not touched.")
+            st.rerun()
+        st.caption("The cache holds only what was downloaded. Ticker aliases, the manual price history and the "
+                   "override prices are yours and stay.")
+
+
+# ---- tab 1: current prices, FX, benchmark -----------------------------------------------------------------------
+def prices_overrides(tracker: Tracker, snap: Snapshot) -> None:
+    p, md, s = snap.portfolio, snap.md, snap.settings
     st.markdown("#### Stock prices")
     df = T.prices_table(md, p, s)
     edited = st.data_editor(
-        df, hide_index=True, key="px_editor", disabled=[c for c in df.columns if c not in ("Yahoo symbol", "Override")],
+        df, hide_index=True, key="px_editor", disabled=[c for c in df.columns if c != "Override"],
         column_config={"Last close": st.column_config.NumberColumn(format="%.4f"),
                        "Price date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                       "Override": st.column_config.NumberColumn(format="%.4f", help="Manual price - wins over "
-                                                                  "downloaded and statement prices"),
-                       "Yahoo symbol": st.column_config.TextColumn(help="Change when Yahoo uses another symbol "
-                                                                    "(e.g. BRK-B, NOVO-B.CO)"),
+                       "Override": st.column_config.NumberColumn(format="%.4f", help="One manual price for today's "
+                                                                  "value - wins over downloaded, manual-history and "
+                                                                  "statement prices"),
+                       "Yahoo symbol": st.column_config.TextColumn(help="Change it in the Ticker mapping tab"),
                        "Price used": st.column_config.NumberColumn(format="%.4f")}, **stretch())
+    st.caption("An **override** replaces today's price only. For a whole price history (a stock Yahoo does not know, "
+               "or gaps in it) use *Manual price history*; to point a stock at the right Yahoo symbol use "
+               "*Ticker mapping*.")
 
     st.markdown("#### FX rates (units of currency per 1 USD)")
     fx_df = T.fx_status_table(md, p, s)
@@ -484,31 +615,264 @@ def market_data(tracker: Tracker, snap: Snapshot) -> None:
         bench_over = st.number_input("Manual benchmark price (USD)", value=s.get("benchmark_override"),
                                      placeholder="no override", key="w_bench_over", min_value=0.0, format="%.4f")
 
-    if st.button("💾  Save symbols and overrides", key="save_over"):
-        auto = lambda t, c: tracker.service.symbol_for(p, {}, t, c)                       # noqa: E731
-        symbols = {}
-        prices = {}
+    if st.button("💾  Save overrides", key="save_over"):
+        # the table shows this account's stocks only: overrides of other accounts' stocks are kept as they are
+        shown = {f"{t}|{c}" for t, c in p.positions_keys()}
+        prices = {k: v for k, v in (s.get("price_overrides") or {}).items() if k not in shown}
         for _, row in edited.iterrows():
-            key = f"{row['Ticker']}|{row['Currency']}"
-            sym = str(row["Yahoo symbol"] or "").strip()
-            if sym and sym != auto(row["Ticker"], row["Currency"]):
-                symbols[key] = sym
             if pd.notna(row["Override"]) and float(row["Override"]) > 0:
-                prices[key] = float(row["Override"])
-        fx_over = {r["Currency"]: float(r["Override"]) for _, r in fx_edit.iterrows()
-                   if pd.notna(r["Override"]) and float(r["Override"]) > 0}
-        tracker.update_settings(yahoo_symbols=symbols, price_overrides=prices, fx_overrides=fx_over,
+                prices[f"{row['Ticker']}|{row['Currency']}"] = float(row["Override"])
+        shown_fx = set(fx_edit["Currency"])
+        fx_over = {k: v for k, v in (s.get("fx_overrides") or {}).items() if k not in shown_fx}
+        fx_over.update({r["Currency"]: float(r["Override"]) for _, r in fx_edit.iterrows()
+                        if pd.notna(r["Override"]) and float(r["Override"]) > 0})
+        tracker.update_settings(price_overrides=prices, fx_overrides=fx_over,
                                 benchmark_override=float(bench_over) if bench_over else None)
-        flash("success", "Saved. Press Refresh Prices to download prices for changed symbols.")
+        flash("success", "Overrides saved.")
         if s.get("export_excel"):
             post_outcome(tracker.export(p.account), "Overrides")
         st.rerun()
 
-    with st.expander("Maintenance"):
-        if st.button("Clear the downloaded price cache", key="clear_cache"):
-            tracker.store.clear_market_cache()
-            flash("info", "Market-data cache cleared. Press Refresh Prices to download it again.")
+
+# ---- tab 2: ticker mapping ---------------------------------------------------------------------------------------
+def report_mapping(out) -> None:
+    """Queue the messages of a saved / imported mapping."""
+    for m in out.messages:
+        flash("success", m)
+    for e in out.errors:
+        flash("error", e)
+    if out.report is not None:
+        for sym, err in out.report.errors.items():
+            flash("warning", f"{sym}: {short_error(err)}")
+        if out.report.errors:
+            st.session_state["refresh_errors"] = {sym: short_error(err) for sym, err in out.report.errors.items()}
+    if not out.changed and not out.errors:
+        flash("info", "The mapping is unchanged.")
+
+
+def ticker_mapping(tracker: Tracker, snap: Snapshot) -> None:
+    p, s = snap.portfolio, snap.settings
+    online = s.get("price_source", "yahoo") == "yahoo"
+    st.markdown("#### Ticker mapping - IBKR ticker → Yahoo Finance symbol")
+    st.caption(
+        "Prices are downloaded under the **symbol used**. The automatic rule (listing exchange → suffix, "
+        "e.g. `NOVOB` on CPH → `NOVOB.CO`) fits most stocks. When Yahoo Finance calls a stock differently, type the "
+        "right symbol as **alias** - it is saved permanently and used for every download, workbook and account. "
+        "Tick **manual prices only** for a stock Yahoo does not know at all: it is never downloaded and you provide "
+        "its prices in the *Manual price history* tab.")
+    rows = tracker.mapping_rows(p, s)
+    if not rows:
+        st.info("This portfolio holds no stocks.")
+        return
+    nonce = st.session_state.setdefault("map_nonce", 0)
+    df = T.mapping_table(rows)
+    edited = st.data_editor(
+        df, hide_index=True, key=f"map_editor_{nonce}",
+        disabled=[c for c in df.columns if c not in ("Your symbol (alias)", "Manual prices only")],
+        column_config={
+            "Your symbol (alias)": st.column_config.TextColumn(help="Yahoo Finance symbol, e.g. BRK-B, NOVO-B.CO, "
+                                                                     "0700.HK. Empty = use the automatic symbol."),
+            "Manual prices only": st.column_config.CheckboxColumn(help="Never download this stock - use the manual "
+                                                                        "price history only."),
+            "Held now": st.column_config.CheckboxColumn(),
+            "Currency": st.column_config.TextColumn(width="small"), "Ticker": st.column_config.TextColumn(width="small"),
+            "Status": st.column_config.TextColumn(width="large")}, **stretch())
+    c1, c2 = st.columns([1, 2])
+    download = c2.checkbox("Download the prices of the changed symbols right away", value=online, disabled=not online,
+                           key="map_download")
+    if c1.button("💾  Save mapping", key="map_save", type="primary"):
+        edits = {f"{r['Ticker']}|{r['Currency']}": ("" if pd.isna(r["Your symbol (alias)"])
+                                                   else str(r["Your symbol (alias)"]),
+                                                   bool(r["Manual prices only"])) for _, r in edited.iterrows()}
+        bar, cb = progress_bar("Saving ...")
+        out = tracker.save_mapping(p, edits, download=bool(download) and online, progress=cb)
+        bar.empty()
+        report_mapping(out)
+        if out.changed and s.get("export_excel"):
+            post_outcome(tracker.export(p.account), "Ticker mapping")
+        st.session_state["map_nonce"] = nonce + 1
+        st.rerun()
+
+    with st.expander("Test a symbol, then use it", expanded=False):
+        st.caption("Asks Yahoo Finance for the last two weeks of the symbol: does it exist, what does it cost and in "
+                   "which currency is it quoted?")
+        labels = {f"{r.ticker} ({r.currency})": r for r in rows}
+        c1, c2 = st.columns(2)
+        label = c1.selectbox("Stock", list(labels), key="map_test_stock")
+        symbol = c2.text_input("Yahoo Finance symbol", key="map_test_symbol", placeholder="e.g. BRK-B")
+        row = labels[label]
+        b1, b2, _ = st.columns([1, 1, 2])
+        if b1.button("🔎  Test symbol", key="map_test", disabled=not online):
+            res = tracker.check_symbol(symbol, row.currency)
+            (st.success if res.ok and res.currency_ok else st.warning if res.ok else st.error)(res.message)
+        if b2.button("✔  Use this symbol", key="map_use"):
+            bar, cb = progress_bar("Saving ...")
+            out = tracker.save_mapping(p, {row.key: (symbol, row.manual_only)}, download=online, progress=cb)
+            bar.empty()
+            report_mapping(out)
+            if out.changed and s.get("export_excel"):
+                post_outcome(tracker.export(p.account), "Ticker mapping")
+            st.session_state["map_nonce"] = nonce + 1
             st.rerun()
+        if not online:
+            st.caption("Offline mode (statements only) is on - symbols cannot be tested.")
+
+    with st.expander("Mapping file - export / import", expanded=False):
+        st.caption("The mapping is stored with the settings in the data folder. Export it as a small CSV file "
+                   "(`Ticker, Currency, Symbol, Manual only`) to back it up, edit it in a spreadsheet or use it on "
+                   "another computer; an imported file is merged into the saved mapping.")
+        st.download_button("⬇  Download ticker_mapping.csv", data=tracker.mapping_csv().encode("utf-8-sig"),
+                           file_name="ticker_mapping.csv", mime="text/csv", key="map_download_csv")
+        up = st.file_uploader("Import a mapping file", type=["csv", "txt"], key=f"map_upload_{nonce}")
+        if up is not None and st.button("Import the file", key="map_import"):
+            try:
+                text = up.getvalue().decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = up.getvalue().decode("cp1252", errors="replace")
+            bar, cb = progress_bar("Importing ...")
+            out = tracker.import_mapping(p, text, download=online, progress=cb)
+            bar.empty()
+            report_mapping(out)
+            if out.changed and s.get("export_excel"):
+                post_outcome(tracker.export(p.account), "Ticker mapping")
+            st.session_state["map_nonce"] = nonce + 1
+            st.rerun()
+
+
+# ---- tab 3: manual price history ---------------------------------------------------------------------------------
+def manual_price_history(tracker: Tracker, snap: Snapshot) -> None:
+    p, s = snap.portfolio, snap.settings
+    st.markdown("#### Manual price history - `Date, Price`")
+    st.caption(
+        "For a stock Yahoo Finance does not know - or only partly - add its closing prices yourself: paste them, "
+        "upload a CSV file or type them in. They are merged with the downloaded prices (on a day that both have, "
+        "**yours wins**), set the current price when they are the newest, and value the stock on every day of the "
+        "performance history. Prices are in the stock's **trading currency** and split-adjusted (like Yahoo's Close). "
+        "Manual prices are never removed by *Clear the downloaded price cache*.")
+    summary = tracker.manual_price_summary()
+    bench_sym = s.get("benchmark_symbol") or "benchmark"
+    show_df(T.manual_prices_table(p, summary, BENCHMARK_KEY, bench_sym))
+
+    targets = {f"{t} ({c})": f"{t}|{c}" for t, c in p.positions_keys()}
+    targets[f"Benchmark {bench_sym} (in its quote currency)"] = BENCHMARK_KEY
+    nonce = st.session_state.setdefault("mp_nonce", 0)
+    label = st.selectbox("Add prices for", list(targets), key="mp_target")
+    key = targets[label]
+    existing = tracker.manual_prices(key)
+    if existing:
+        st.caption(f"{len(existing)} manual price(s) saved for {label}: {existing[0][0]} → {existing[-1][0]}.")
+    else:
+        st.caption(f"No manual prices saved for {label} yet.")
+
+    tab_paste, tab_file, tab_type = st.tabs(["Paste text", "Upload a file", "Type rows"])
+    parsed, error, source = None, "", "pasted text"
+    with st.expander("Options for unusual data", expanded=False):
+        o1, o2 = st.columns(2)
+        decimal = o1.selectbox("Decimal mark", ["auto", ".", ","], key=f"mp_decimal_{nonce}")
+        order = o2.selectbox("Dates like 01/02/2026", ["auto", "day first", "month first"], key=f"mp_order_{nonce}")
+    opts = {"decimal": None if decimal == "auto" else decimal,
+            "date_order": {"auto": None, "day first": "dmy", "month first": "mdy"}[order]}
+    with tab_paste:
+        text = st.text_area("One price per line: a date and the closing price", height=170, key=f"mp_text_{nonce}",
+                            placeholder="Date,Price\n2026-01-02,125.40\n2026-01-05,127.15",
+                            help="Separators: comma, semicolon or tab. Dates such as 2026-01-02, 02.01.2026 or "
+                                 "Jan 2, 2026. A header line is optional.")
+    with tab_file:
+        up = st.file_uploader("CSV or text file", type=["csv", "txt", "tsv"], key=f"mp_file_{nonce}",
+                              help="Two columns Date, Price - or a Yahoo-style table with a Close column.")
+    with tab_type:
+        grid = st.data_editor(
+            pd.DataFrame({"Date": pd.Series(dtype="datetime64[ns]"), "Price": pd.Series(dtype="float64")}),
+            num_rows="dynamic", hide_index=True, key=f"mp_grid_{nonce}",
+            column_config={"Date": st.column_config.DateColumn(format="YYYY-MM-DD", required=True),
+                           "Price": st.column_config.NumberColumn(format="%.4f", min_value=0.0, required=True)},
+            **stretch())
+    try:
+        if text and text.strip():
+            parsed = tracker.parse_manual_prices(text, **opts)
+        elif up is not None:
+            parsed, source = tracker.parse_manual_prices_file(up.getvalue(), **opts), f"upload: {up.name}"
+        elif len(grid.dropna()):
+            lines = [f"{pd.Timestamp(d):%Y-%m-%d};{float(v)!r}" for d, v in grid.dropna().itertuples(index=False)]
+            parsed, source = tracker.parse_manual_prices("\n".join(lines), decimal=".", date_order="dmy"), "typed rows"
+    except PriceParseError as exc:
+        error = str(exc)
+
+    if error:
+        st.error(error)
+    if parsed is not None:
+        if parsed.ok:
+            st.success(parsed.describe())
+        else:
+            st.error("No valid price rows were found.")
+        for w in parsed.warnings:
+            st.warning(w)
+        if parsed.errors:
+            with st.expander(f"{parsed.n_errors} line(s) cannot be used", expanded=not parsed.ok):
+                for e in parsed.errors:
+                    st.write("- " + e)
+        if parsed.ok:
+            rows = parsed.rows if len(parsed.rows) <= 12 else parsed.rows[:6] + parsed.rows[-6:]
+            show_df(pd.DataFrame(rows, columns=["Date", "Price"]),
+                    column_config={"Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                                   "Price": st.column_config.NumberColumn(format="%.4f")})
+            if len(parsed.rows) > 12:
+                st.caption(f"First and last 6 of {len(parsed.rows)} prices.")
+            mode = st.radio("If this stock already has manual prices",
+                            ["Add to them (a day in the new data overwrites that day)",
+                             "Replace all manual prices of this stock"], key=f"mp_mode_{nonce}")
+            skip_ok = True
+            if parsed.n_errors:
+                skip_ok = st.checkbox(f"Skip the {parsed.n_errors} unusable line(s) and save the rest",
+                                      key=f"mp_skip_{nonce}")
+            if st.button("💾  Save these prices", key="mp_save", type="primary", disabled=not skip_ok):
+                n = tracker.save_manual_prices(key, parsed.rows, source=source, replace=mode.startswith("Replace"))
+                flash("success", f"{n} manual price(s) saved for {label}. They are used immediately.")
+                if s.get("export_excel"):
+                    post_outcome(tracker.export(p.account), "Manual prices")
+                st.session_state["mp_nonce"] = nonce + 1
+                st.rerun()
+
+    if existing:
+        with st.expander(f"Saved manual prices of {label} ({len(existing)})"):
+            ex = pd.DataFrame(existing, columns=["Date", "Price"])
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                show_df(ex, column_config={"Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                                           "Price": st.column_config.NumberColumn(format="%.4f")}, height=260)
+            with c2:
+                if len(ex) >= 2:
+                    st.line_chart(ex.assign(Date=pd.to_datetime(ex["Date"])).set_index("Date"), height=260,
+                                  **stretch())
+            st.download_button("⬇  Download as CSV", data=prices_to_text(existing).encode("utf-8"),
+                               file_name=f"manual_prices_{key.replace('|', '_').replace('@', '')}.csv",
+                               mime="text/csv", key="mp_download")
+            sure = st.checkbox("Yes, delete all manual prices of this stock", key=f"mp_sure_{nonce}")
+            if st.button("🗑  Delete", key="mp_delete", disabled=not sure):
+                n = tracker.delete_manual_prices(key)
+                flash("info", f"{n} manual price(s) of {label} deleted.")
+                if s.get("export_excel"):
+                    post_outcome(tracker.export(p.account), "Manual prices")
+                st.session_state["mp_nonce"] = nonce + 1
+                st.rerun()
+
+
+# ---- tab 4: coverage ---------------------------------------------------------------------------------------------
+def price_coverage(snap: Snapshot) -> None:
+    st.markdown("#### Price coverage of the performance history")
+    h = snap.history()
+    if h is None or h.empty:
+        st.info("The history needs the numbers - see the notes above.")
+        return
+    st.caption("Every day a stock was held is valued with its newest known close. This table shows where the prices "
+               "come from and where they run out - add what is missing under *Manual price history*.")
+    for note in h.notes:
+        st.warning(note)
+    cov = T.coverage_table(h)
+    if len(cov):
+        show_df(cov, column_config=COVERAGE_COLUMNS)
+    if not h.notes:
+        st.success("Every held day is valued with a real, recent price.")
 
 
 def archive(tracker: Tracker, account: str) -> None:

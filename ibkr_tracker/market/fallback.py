@@ -26,6 +26,19 @@ def statement_prices(portfolio: Portfolio) -> dict[str, PricePoint]:
     return out
 
 
+def statement_price_points(portfolio: Portfolio) -> dict[str, list[tuple[date, float]]]:
+    """Every period-end close price printed in the statements: ``{"TICKER|CCY": [(period end, price), ...]}``
+    (ascending).  A sparse but real price history for stocks that Yahoo does not know."""
+    out: dict[str, dict[date, float]] = defaultdict(dict)
+    for s in portfolio.statements:
+        if not s.period_end:
+            continue
+        for op in s.open_positions:
+            if op.close_price:
+                out[f"{op.ticker}|{op.currency}"][s.period_end] = op.close_price
+    return {k: sorted(v.items()) for k, v in out.items()}
+
+
 def _solve_units_per_usd(rates: dict[tuple[str, str], float]) -> dict[str, float]:
     """``rates[(A, B)] = units of B per 1 A``  ->  units of each currency per 1 USD (graph walk from USD)."""
     units = {"USD": 1.0}

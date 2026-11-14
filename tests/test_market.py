@@ -191,13 +191,31 @@ def test_refresh_gives_up_quickly_when_yahoo_is_unreachable(store, pf_csv):
     assert not rep.fetched and rep.summary().endswith("6 skipped.")
 
 
-def test_success_after_failures_does_not_abort(store, pf_csv):
-    prov = FakeProvider(fail=("AMZN", "BN", "GOOGL"), last_day=TODAY)           # three failures, but the rest works...
+def test_failing_stocks_do_not_make_the_refresh_give_up(store, pf_csv):
+    """Three stocks fail in a row (a naming problem at Yahoo) - but the FX pairs and the benchmark are fetched first
+    and arrive, so Yahoo is evidently reachable: the refresh goes on with the rest."""
+    prov = FakeProvider(fail=("AMZN", "BN", "GOOGL"), last_day=TODAY)
     rep = MarketDataService(store, prov, today=lambda: TODAY).refresh(pf_csv, DEFAULT_SETTINGS)
-    assert rep.aborted                                                          # ...yet nothing succeeded before them
-    prov2 = FakeProvider(fail=("META", "MSFT", "NVO"), last_day=TODAY)          # failures after earlier successes
+    assert not rep.aborted and set(rep.errors) == {"AMZN", "BN", "GOOGL"} and len(rep.fetched) == 6
+    assert [c[0] for c in prov.calls[:3]] == ["HUF=X", "EUR=X", "VUAA.L"]           # sentinels before the stocks
+    prov2 = FakeProvider(fail=("META", "MSFT", "NVO"), last_day=TODAY)
     rep2 = MarketDataService(store, prov2, today=lambda: TODAY).refresh(pf_csv, DEFAULT_SETTINGS)
     assert not rep2.aborted and len(rep2.errors) == 3 and len(rep2.fetched) == 6
+
+
+def test_refresh_only_downloads_the_requested_symbols(store, pf_csv):
+    prov = FakeProvider(last_day=TODAY)
+    rep = MarketDataService(store, prov, today=lambda: TODAY).refresh(pf_csv, DEFAULT_SETTINGS, only=["AMZN", "META"])
+    assert {c[0] for c in prov.calls} == {"AMZN", "META"} and set(rep.fetched) == {"AMZN", "META"}
+
+
+def test_manual_only_stocks_are_never_downloaded(store, pf_csv):
+    prov = FakeProvider(last_day=TODAY)
+    svc = MarketDataService(store, prov, today=lambda: TODAY)
+    s = dict(DEFAULT_SETTINGS, manual_only=["AMZN|USD"])
+    assert "AMZN" not in svc.required_symbols(pf_csv, s) and "AMZN" in svc.required_symbols(pf_csv, DEFAULT_SETTINGS)
+    svc.refresh(pf_csv, s)
+    assert "AMZN" not in {c[0] for c in prov.calls}
 
 
 def test_statement_mode_never_touches_the_network(store, pf_csv):

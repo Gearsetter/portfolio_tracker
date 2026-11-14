@@ -13,8 +13,14 @@ periods, any number of accounts) and get
   *in place* – without regenerating the file;
 * an optional **view filter** that hides fully closed positions and dust cash balances (< 0.5) from the dashboard
   lists, the workbook and the CSV files – without changing a single total (§12);
-* a local **archive** (SQLite) of every statement, downloaded price/FX series and your settings, so history
-  survives restarts and old statements can be combined with new ones.
+* the **performance of the whole lifespan, day by day** – value, deposits, gain, return, CAGR, allocation and the
+  VUAA comparison from the first transaction to today, rebuilt from the transactions and the daily prices instead
+  of from the moments you pressed *Refresh* (§15);
+* a **ticker mapping** (IBKR ticker → Yahoo Finance symbol, saved permanently, §13) and a **manual price history**
+  (paste, upload or type `Date, Price`) for a stock Yahoo does not know, which flows into every valuation next to the
+  downloaded prices (§14);
+* a local **archive** (SQLite) of every statement, downloaded price/FX series, your manual prices and your settings, so
+  history survives restarts and old statements can be combined with new ones.
 
 Everything runs on your own computer. The only network access is the (optional) download of daily closing prices
 from Yahoo Finance.
@@ -58,9 +64,10 @@ A ready‑made example built from the two statements you supplied is in
 **The dashboard** shows, from top to bottom: total value, net deposits, return and CAGR in USD; the same in your
 base currency; stocks, cash, "what the same purchases would be worth in VUAA" and the **VUAA CAGR (USD)**; a small
 *Benchmark comparison · details* card (**Stocks minus VUAA (USD)**, stocks CAGR on the same basis, VUAA return,
-average years since the purchases); in the consolidated view an **Accounts** table; then positions, cash balances,
-allocation and the value history (with the view filter on, closed positions and dust balances are not listed there –
-a one‑line note says what was left out).
+average years since the purchases); in the consolidated view an **Accounts** table; then **Performance since the
+first transaction** (the day‑by‑day charts of §15); then positions, cash balances and allocation (with the view
+filter on, closed positions and dust balances are not listed there – a one‑line note says what was left out). Problems
+with a ticker or a missing price are solved in the *Market data* tab (§13, §14).
 
 ## 2. What the workbook contains
 
@@ -80,9 +87,11 @@ formulas black, cross‑sheet look‑ups green, yellow = cells you may overwrite
 | 9 | `J:Q`, 1 empty row below §8 | **Summary (base currency)** – `M` = §8 `O` × latest USD/base rate, `N` return, `Q` CAGR |
 | 10 | below §9 | *Extra:* **benchmark block** – the same USD amounts invested in VUAA, value today, **Stocks minus VUAA (USD)**, average years since the purchases, **VUAA CAGR (USD)** and the stocks' CAGR on the same basis |
 
-Other sheets: **Prices** (latest prices, FX, the settings that all formulas read, yellow *Override* columns),
-**FX** and **Benchmark** (daily history used for purchase‑date conversions), **Checks** (reconciliation with the
-statement: cash per currency, share counts, NAV), **About** (index with links, conventions, warnings, statements
+Other sheets: **Prices** (latest prices with the Yahoo symbol and the source of each price – including your
+aliases and manual prices –, FX, the settings that all formulas read, yellow *Override* columns),
+**FX** and **Benchmark** (daily history used for purchase‑date conversions), **History** (one row per day of the whole
+lifespan with two charts – §15; values, not formulas), **Checks** (reconciliation with the statement: cash per
+currency, share counts, NAV), **About** (index with links, conventions, warnings, data‑coverage notes, statements
 included) and a hidden `_state` sheet (layout version, archive signature, snapshot of your overrides).
 
 In the **consolidated workbook** (`IBKR_Portfolio_ALL.xlsx`, see §6) the records of Sections 1–4 carry a ninth
@@ -96,24 +105,28 @@ Only classic functions are used (`SUMIFS`, `INDEX/MATCH`, `IFERROR`, `SUMPRODUCT
 
 1. New daily closes are requested **incrementally** (from a week before the last cached day; the first run goes back
    to two weeks before your first transaction). Today's unfinished bar is dropped. Pence quotes (GBp) are converted.
-2. Priority of the numbers: **your override > Yahoo Finance (cache) > closing price printed in the statement**.
-   A failing symbol never stops the others; after three consecutive failures without a single success the app gives
-   up quickly (offline) and keeps working with the cached / statement data.
-3. The existing workbook is updated **in place**: only `Prices`, `FX`, `Benchmark`, `About` (and the hidden state)
-   are rewritten – every formula, format and comment of `Portfolio` and `Checks` stays exactly as it is and
+2. Priority of the numbers: **your single‑price override > your manual price history (§14) > Yahoo Finance (cache) >
+   closing price printed in the statement** – day by day for the history, and the newest point of the merged series is
+   the current price. The FX rates and the benchmark are requested **first**, then the stocks one by one; a failing
+   symbol never stops the others, and after three consecutive failures without a single success the app gives up
+   quickly (offline) and keeps working with the cached / statement / manual data. Stocks set to *manual prices only*
+   (§13) are never requested.
+3. The existing workbook is updated **in place**: only `Prices`, `FX`, `Benchmark`, `History`, `About` (and the hidden
+   state) are rewritten – every formula, format and comment of `Portfolio` and `Checks` stays exactly as it is and
    recalculates. If the statement archive changed (new transactions, other layout version) or you switched the view
    filter (§12) the workbook is regenerated and the previous file is kept as `…previous.xlsx`. The file is written atomically; if Excel has it open you get a
    clear message and nothing is changed. The consolidated workbook is refreshed the same way.
-4. A value snapshot is stored at every refresh (Dashboard → *Value history*), separately for every account and for
-   the consolidated view.
+4. A small value snapshot is still stored at every refresh, separately for every account and for the consolidated
+   view (kept for the archive). The charts no longer depend on it: since 1.3.0 the history is rebuilt for every day
+   from the first transaction (§15).
 
 **Overrides.** Type a price / FX rate / benchmark price into a yellow cell of the `Prices` sheet *or* into the app's
 *Market data* tab. Edits made in Excel are adopted by the app at the next refresh (three‑way merge with the
 snapshot in `_state`; an edit in the file wins, clearing a cell removes the override).
 
 **Settings** (export toggle, view filter, price source, benchmark symbol, days per year, base currency of the
-consolidated view, CSV format, output folder, overrides, symbol mapping, last account) are stored in `data/tracker.db` and restored at
-the next start.
+consolidated view, CSV format, output folder, overrides, ticker mapping, last account) and your **manual prices** are
+stored in `data/tracker.db` and restored at the next start.
 
 ## 4. Conventions and interpretation choices
 
@@ -215,13 +228,15 @@ ibkr_tracker/
   portfolio.py             merges statements chronologically per account, de-duplicates, Open Positions share counts,
                            consolidate() = all accounts as one portfolio
   calc.py                  Python implementation of every number the workbook computes (oracle + dashboard)
+  history.py               day-by-day reconstruction of the whole lifespan (value, deposits, return, CAGR, benchmark)
   reconcile.py             cash / share counts / NAV versus the statement(s)
-  market/                  Yahoo provider, SQLite cache, statement-derived fallback, symbol mapping
+  market/                  Yahoo provider, SQLite cache, statement-derived fallback, symbol rules, merged price series,
+                           mapping.py (ticker aliases), manual.py (the Date, Price reader), service.py (refresh / build)
   excel/                   builder (workbook), refresh (in-place update / rebuild), overrides, recalc (cached values)
   exports.py, tables.py    CSV export (international / European dialect) and the tables behind it and the GUI
   storage.py, tracker.py   archive + settings (SQLite) and the service layer used by the GUI
 scripts/make_sample_workbook.py   regenerates examples/output/*.xlsx offline from examples/statements
-tests/                     281 tests (pytest)
+tests/                     486 tests (pytest)
 .devcontainer/             VS Code dev container: Dockerfile, devcontainer.json, post-create.sh (see §11)
 .vscode/                   F5 debug configuration, tasks (run the app, tests), recommended extensions
 ```
@@ -241,7 +256,7 @@ there – in *Protected View* click **Enable Editing** once and Excel fills in t
 * **Live Yahoo Finance access was not testable while this was developed** (the build environment has no access to
   Yahoo). The download code is covered by tests with a deterministic fake provider and synthetic Yahoo‑style responses,
   and falls back gracefully, but the first *Refresh Prices* on your computer is the real test. If it reports problems,
-  open *Market data* – you can change the Yahoo symbol of a stock, or type a manual price.
+  open *Market data* – you can give a stock its own Yahoo symbol (§13) or add its prices yourself (§14).
 * The example workbook in `examples/output` was therefore generated **offline**: prices/FX come from the statements
   (period‑end close), the VUAA columns – and with them the VUAA CAGR – are blank until a refresh has downloaded
   benchmark prices.
@@ -259,6 +274,11 @@ there – in *Protected View* click **Enable Editing** once and Excel fills in t
   currency).
 * Positions in currencies other than your base currency need an FX rate: the app takes it from the statements
   (forex trades / closing rates) or from Yahoo; otherwise it asks for a manual rate.
+* The **daily history** (§15) is a reconstruction. It values every day with today's share counts (corrected by the
+  Open Positions rule) and the split‑adjusted closes of that day – exactly right for splits, but it assumes that the
+  prices you enter by hand are split‑adjusted as well. Days without a price are valued at the stock's last purchase /
+  sale price and flagged; a stock a provider has never heard of needs a symbol (§13) or manual prices (§14) for a
+  meaningful curve. Intraday timing, accrued interest and a position that was transferred out are not modelled.
 
 ## 10. Tests
 
@@ -278,6 +298,16 @@ cell‑by‑cell comparison of the LibreOffice‑recalculated workbook with the 
 the specification, in‑place refresh and override merging, locked files, the GUI (Streamlit `AppTest` and an optional
 real‑browser smoke test), a check of the totals against IBKR's own *Open Positions*, *Cash Report* and NAV, and
 consistency checks of the dev container configuration (port, build context, line endings, …).
+
+The three 1.3.0 features have their own test files: `test_history.py` replays the synthetic account day by day against
+a ledger written out **by hand** (every one of its 356 days: stocks, cash, total, deposits at the rate of their day,
+return, CAGR, the benchmark replay, splits, an opening balance, missing / stale / manual prices, several accounts,
+independence from refreshes), `test_history_exports.py` (Excel *History* sheet cell by cell, charts, in‑place refresh,
+a workbook of version 1.2 gaining the sheet, `history.csv`, a LibreOffice cross‑check of the last day against the
+`Portfolio` formulas), `test_manual_prices.py` (every date and number format, decoding, error reporting, storage,
+persistence, priority and merging in the valuation, the benchmark, the workbook) and `test_mapping.py` (symbol rules,
+edits, the mapping file, symbol test, persistence, targeted download, wrong‑currency protection, the workbook); the
+screens are exercised with Streamlit's `AppTest`.
 
 ## 11. Development container (VS Code)
 
@@ -350,7 +380,132 @@ figure changes.
 * **Market data** – the *Market data* tab and the `Prices` / `FX` sheets list every stock and currency (a closed
   position without a price is marked *not needed (position closed)*).
 
+## 13. Ticker mapping – IBKR ticker → Yahoo Finance symbol
+
+Prices are downloaded under a **symbol**. The automatic rule turns the IBKR ticker and listing exchange into the Yahoo
+symbol (`NOVOB` on CPH → `NOVOB.CO`, `SAP` on IBIS → `SAP.DE`, `BRK B` → `BRK-B`) and fits most stocks. When Yahoo
+Finance calls a stock differently – or the rule guesses the wrong listing – the download fails or returns nothing.
+*Market data → **Ticker mapping*** fixes that permanently.
+
+* The table lists every stock of the portfolio: ticker, currency, whether it is **held now**, the **automatic symbol**,
+  **your symbol (alias)**, **manual prices only**, the **symbol used** and a **status** (not downloaded yet · ok, N
+  prices, newest … · last download failed: … · quoted in another currency …), followed by the stock's name and the IBKR
+  exchange the automatic symbol is derived from. Problems are marked `[!]`.
+* Type the correct Yahoo symbol into **Your symbol (alias)** and press **Save mapping**. The changed symbols – and only
+  those, not the whole refresh – are downloaded right away (untick *Download the prices of the changed symbols right
+  away* to postpone it). Clearing the cell returns to the automatic symbol; typing the automatic symbol is no override.
+* **Saved permanently.** The mapping is part of the settings in `data/tracker.db`: it survives restarts, applies to
+  every account and the consolidated view, to every download and to the `Prices` sheet of the workbook (*Yahoo symbol*
+  column), and it is never touched by *Clear the downloaded price cache*. Saving it while one account is open keeps the
+  entries of the stocks that account does not hold.
+* **Test a symbol, then use it.** Pick the stock, type a symbol and press *Test symbol*: the app asks Yahoo Finance for
+  the last two weeks and tells you whether the symbol exists, its last close and the currency it is quoted in – with a
+  warning when that is not the currency IBKR trades the stock in. *Use this symbol* saves it.
+* **Protection against the wrong listing.** If the cached prices of a symbol are quoted in another currency than the
+  one the stock trades in at IBKR (the Frankfurt listing of a US stock, pence versus pounds …), they are **ignored** and
+  a note names the stock and the symbol – the stock keeps its statement price until you choose a better symbol.
+* **Manual prices only.** Tick it for a stock Yahoo does not know at all: the stock is never requested, and its prices
+  come from the *Manual price history* (§14). Until you enter some, the status says so.
+* **Mapping file.** *Mapping file – export / import* saves the mapping as a small CSV (`Ticker, Currency, Symbol,
+  Manual only`; comma, semicolon or tab separated; a byte order mark is fine) – a backup, something to edit in a
+  spreadsheet, or a way to move to another computer. An imported file is **merged** into the saved mapping line by line;
+  unusable lines are listed with their line number and the rest is applied. A line without *Currency* applies to the
+  ticker in every currency (a line for `SAP, EUR` wins over one for `SAP`).
+* A symbol may contain letters, digits and `. - = ^ _ &` (no blanks – Yahoo writes `BRK-B` for `BRK B`).
+
+## 14. Manual price history – `Date, Price`
+
+For a stock Yahoo Finance does not know – or only partly – *Market data → **Manual price history*** takes the closing
+prices from you. It works for every stock of the portfolio and, with its own entry, for the **benchmark** (in the
+benchmark's quote currency, USD for VUAA.L).
+
+* **Three ways in**: *Paste text*, *Upload a file* (CSV / text / TSV) or *Type rows* in a small table. Every way ends in
+  the same preview – how many prices, the first and last day, the first and last rows – before anything is saved.
+* **Formats.** Two columns, `Date, Price`, in any of: `2026-01-02,125.40` · `02.01.2026;125,40` · `Jan 2, 2026<TAB>1,234.50`
+  · a table copied from Excel · a Yahoo‑style download (`Date, Open, High, Low, Close, Adj Close, Volume` – the *Close*
+  column is used) · a header in English or Hungarian, or none. Separator (comma, semicolon, tab, blank), decimal mark
+  and date order are detected; *Options for unusual data* overrides them. Dates may be `2026-01-02`, `2026/01/02`,
+  `02.01.2026`, `2 Jan 2026`, `January 2nd, 2026`, `20260102`, with a time, or an Excel serial number; `13/01/2026`
+  proves day‑first for the whole file, and a file whose order is ambiguous says so.
+* **Line by line diagnostics.** Unusable lines are listed with their line number and the reason (not a date, not a
+  price, zero or negative, in the future, before 1970); you must tick *Skip the N unusable line(s) and save the rest*
+  before the rest can be saved. A date that occurs twice keeps its last value; a **jump of more than ×1.5 between two
+  consecutive prices** is flagged as a probable typing error or an unadjusted stock split.
+* **Prices are in the stock's trading currency and split‑adjusted** (like Yahoo's *Close*) – the history multiplies them
+  with today's share counts (§15).
+* **Add or replace.** By default new data are added and a day that already exists is overwritten; *Replace all manual
+  prices of this stock* starts over. The saved prices can be listed, downloaded as CSV and deleted (with a confirmation).
+* **How they enter the valuation.** Per stock, the daily series is merged from the sources by priority – **manual >
+  Yahoo Finance > the closing price printed in the statement** – so manual prices fill the days Yahoo lacks and **win on
+  a day that both have**. The **newest point of the merged series is the current price**: a manual price newer than
+  anything downloaded becomes the current price (source *Manual price history* in the `Prices` sheet and the *Market
+  data* table), an older one only values the past. A single‑price **override** (the yellow cells, §3) still beats
+  everything for the *current* value, but leaves the history untouched. Everything is used at once – dashboard,
+  positions, performance history (§15), workbook, CSV – without a refresh.
+* **Stored in the database**, so they survive restarts, *Refresh Prices* and *Clear the downloaded price cache*.
+* A stock whose newest price is more than 10 days older than the valuation date gets a note (dashboard, *Reconciliation*
+  tab, About sheet) – a manual series that was never extended shows up there.
+
+## 15. Performance history since the first transaction
+
+The dashboard section **Performance since the first transaction** (tabs *Value & deposits · Gain · Return · CAGR ·
+vs. VUAA · Allocation*) covers the **entire lifespan** of the portfolio, day by day. Earlier versions could only chart
+the moments at which *Refresh Prices* had been pressed; now the history is **rebuilt from the transactions and the
+daily price series**, so it is complete from the first refresh on – and from the first transaction backwards in time.
+
+* **Range.** Every calendar day from the first activity of the portfolio (the first transaction, deposit or dividend;
+  the statement period when there is none) to the valuation date. *Currency* (base currency / USD) and *Period* (All,
+  1Y, YTD, 6M, 3M, 1M) only choose what the charts show – the figures always start at the first transaction.
+* **What one day is made of.**
+  * **Cash** – the ledger of every cash movement per currency (trades, fees, dividends and taxes, deposits and
+    withdrawals, interest, forex), up to and including the day – the same ledger that gives the cash balances –
+    converted at that day's FX rate;
+  * **Stocks** – the transactions up to the day, corrected by the Open Positions rule of §5 (splits, transfers, shares
+    nobody bought in the archive count from the first day), times the day's close;
+  * **Net deposits** – every deposit and withdrawal converted at the rate **of its own day**; *return* = value / net
+    deposits, *CAGR* = return ^ (1 / years) − 1 with the deposit‑weighted average age **up to that day** (§4);
+  * **Benchmark** – every purchase and sale replayed into VUAA at that day's close (the simulation of §4, day by day).
+* **The last day is the dashboard.** Its value, deposits, return, CAGR and benchmark figures equal the KPI cards; the app
+  checks it and shows a warning when they differ (only possible when a held stock has no price at all).
+* **Annualising a young portfolio exaggerates**, so the CAGR charts and the CAGR columns start once the average
+  deposit is three months old (the Excel and CSV files keep the raw numbers).
+* **Missing data are handled in the open.** Weekends and holidays carry the last close forward. A day with no price
+  at all is valued at the stock's last purchase / sale price; a price older than 10 days is carried forward and
+  reported; a currency without FX rates is left out and reported; without benchmark prices the benchmark curve is
+  omitted. *Data coverage of the history* (below the charts) and *Market data → **Price coverage*** list, per stock, the
+  days held, the number of prices from Yahoo / your manual history / the statement, the first and last price date and
+  a status – and point to the cure: a symbol (§13) or manual prices (§14).
+* **Exports.** The workbook has a **History** sheet – one row per day with every figure above (and the value of every
+  position in USD), two charts (portfolio value against net deposits; stocks against the VUAA replay) and the coverage
+  notes on the *About* sheet; it is rewritten by every *Refresh Prices* and added to a workbook made by an earlier
+  version at its next refresh. `history.csv` is part of the CSV files, and the dashboard has its own download button.
+  The History sheet holds values, not formulas – it is data for charts and further analysis; the formula‑driven
+  `Portfolio` sheet is unchanged.
+* It does not depend on the view filter of §12 and is computed from the archive, the price cache and your manual
+  prices only – no network access.
+
 ## Changelog
+
+**1.3.0**
+
+* **Ticker mapping** (§13): *Market data → Ticker mapping* maps an IBKR ticker to the Yahoo Finance symbol that works,
+  saved permanently in the settings and used by every download, account and workbook. Test a symbol before using it;
+  targeted download of only the changed symbols; wrong‑currency protection; *manual prices only* for stocks Yahoo does
+  not know; export / import of the mapping as a CSV file. The refresh now requests the FX rates and the benchmark
+  first and the stocks afterwards, so a failing stock symbol can never abort a refresh.
+* **Manual price history** (§14): paste, upload or type `Date, Price` for any stock or the benchmark – every common
+  date and number format, line‑by‑line diagnostics, saved in the database. The manual prices are merged with the
+  downloaded ones (manual > Yahoo > statement per day), set the current price when they are the newest, and value the
+  stock on every day of the history. They survive *Clear the downloaded price cache*.
+* **Full‑lifespan performance history** (§15): value, net deposits, gain, return, CAGR, allocation and the VUAA
+  comparison for every day from the first transaction, rebuilt from the transactions, the daily prices and the daily
+  FX rates (no longer from the refresh timestamps). New dashboard section with period and currency selectors, a data
+  coverage report, the **History** sheet of the workbook (values + two charts, kept up to date in place), `history.csv`.
+* The Excel `Prices` sheet says *MISSING - refresh, add manual prices or enter an override* for a stock without any price.
+* Fixed: a pasted price line such as `13/01/2026,10` is no longer mistaken for a header line.
+* Compatibility: workbooks of version 1.2 stay valid and gain the *History* sheet at their next refresh; the archive
+  database is upgraded automatically (new table `manual_prices`, two new optional settings for the mapping); all
+  existing settings keep their meaning.
 
 **1.2.0**
 

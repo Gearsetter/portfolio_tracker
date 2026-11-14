@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import warnings
 import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -59,7 +60,9 @@ def find_soffice() -> Optional[str]:
 
 
 def _cell_values(path: Path) -> dict[str, dict[str, Any]]:
-    wb = load_workbook(path, data_only=True)
+    with warnings.catch_warnings():                 # openpyxl cannot parse LibreOffice's chart XML; only values matter here
+        warnings.simplefilter("ignore", UserWarning)
+        wb = load_workbook(path, data_only=True)
     out: dict[str, dict[str, Any]] = {}
     for ws in wb.worksheets:
         sheet: dict[str, Any] = {}

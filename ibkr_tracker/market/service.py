@@ -2,20 +2,28 @@
 
 Data priority for every number (highest first):
 
-1. manual overrides (settings / ``Override`` column of the workbook)
-2. Yahoo Finance data from the local cache (extended incrementally by *Refresh Prices*)
-3. values derived from the statements themselves (works fully offline)
+1. a single manual price / rate typed into the ``Override`` column (settings / workbook) - it only decides the
+   *current* value
+2. the user's manual price history (``Date, Price`` pasted or uploaded in the Market data tab) - on the days it
+   covers it wins over the downloaded value; the latest point of the merged series is the current price
+3. Yahoo Finance data from the local cache (extended incrementally by *Refresh Prices*)
+4. values derived from the statements themselves (period-end closes; works fully offline)
+
+Steps 2-4 are merged per day into one :class:`~ibkr_tracker.market.data.PriceSeries` per stock
+(``MarketData.price_series``) - the day-by-day history of the portfolio is valued with it.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from ..portfolio import Portfolio, is_closed
 from ..storage import Store
-from .data import BenchSeries, FxSeries, FxTable, MarketData, PricePoint
-from .fallback import statement_fx, statement_prices
+from .data import (SOURCE_LABEL, SRC_MANUAL, SRC_STATEMENT, SRC_YAHOO, BenchSeries, FxSeries, FxTable, MarketData,
+                   PricePoint, PriceSeries, merge_series)
+from .fallback import statement_fx, statement_price_points, statement_prices
+from .manual import BENCHMARK_KEY
 from .providers import PriceProvider, ProviderError, YahooProvider
 from .symbols import yahoo_symbol
 
@@ -48,6 +56,9 @@ class RefreshReport:
         return s + "."
 
 
+STALE_PRICE_DAYS = 10           # a held stock priced this many days before the valuation date gets a warning
+
+
 class MarketDataService:
     GIVE_UP_AFTER = 3          # consecutive failures (with no success at all) before a refresh is abandoned
 
@@ -62,20 +73,41 @@ class MarketDataService:
         inst = portfolio.instruments.get(ticker)
         return yahoo_symbol(ticker, inst.exchange if inst else "", ccy, settings.get("yahoo_symbols") or {})
 
+    def auto_symbol(self, portfolio: Portfolio, ticker: str, ccy: str) -> str:
+        """The symbol the automatic rule derives from the IBKR ticker and listing exchange (no alias applied)."""
+        return self.symbol_for(portfolio, {}, ticker, ccy)
+
+    @staticmethod
+    def manual_only(settings: dict) -> set[str]:
+        """``"TICKER|CCY"`` keys the user marked as 'never download - I supply the prices myself'."""
+        return {str(k) for k in (settings.get("manual_only") or [])}
+
     @staticmethod
     def fx_symbol(ccy: str) -> str:
         return f"{ccy}=X"                     # Yahoo: units of CCY per 1 USD
 
     def required_symbols(self, portfolio: Portfolio, settings: dict) -> list[str]:
-        syms: list[str] = [self.symbol_for(portfolio, settings, t, c) for t, c in portfolio.positions_keys()]
+        skip = self.manual_only(settings)
+        syms: list[str] = [self.symbol_for(portfolio, settings, t, c) for t, c in portfolio.positions_keys()
+                           if f"{t}|{c}" not in skip]
         syms += [self.fx_symbol(c) for c in portfolio.currencies() if c != "USD"]    # incl. the EUR placeholder row
         if settings.get("benchmark_symbol"):
             syms.append(settings["benchmark_symbol"])
         return list(dict.fromkeys(syms))
 
+    def sentinel_symbols(self, portfolio: Portfolio, settings: dict) -> set[str]:
+        """FX pairs and the benchmark: symbols that certainly exist at Yahoo - when *they* cannot be downloaded the
+        network is down, whereas a stock that fails alone merely has a naming problem."""
+        out = {self.fx_symbol(c) for c in portfolio.currencies() if c != "USD"}
+        if settings.get("benchmark_symbol"):
+            out.add(settings["benchmark_symbol"])
+        return out
+
     # ---- refresh (network) -----------------------------------------------------------------------------
     def refresh(self, portfolio: Portfolio, settings: dict,
-                progress: Optional[Callable[[int, int, str], None]] = None) -> RefreshReport:
+                progress: Optional[Callable[[int, int, str], None]] = None,
+                only: Optional[Iterable[str]] = None) -> RefreshReport:
+        """Download the symbols that are needed (all of them, or just ``only`` - e.g. after a mapping change)."""
         report = RefreshReport(started=datetime.now())
         if settings.get("price_source", "yahoo") != "yahoo":
             report.offline = True
@@ -85,6 +117,13 @@ class MarketDataService:
         today = self._today()
         start_needed = (portfolio.first_activity() or today) - timedelta(days=14)
         symbols = self.required_symbols(portfolio, settings)
+        if only is not None:
+            wanted = set(only)
+            symbols = [x for x in symbols if x in wanted]
+        # FX pairs and the benchmark first: if those arrive, Yahoo is reachable and a failing stock is a naming
+        # problem (fix it in the ticker mapping) - it must not make the refresh give up on everything else
+        sentinels = self.sentinel_symbols(portfolio, settings)
+        symbols.sort(key=lambda x: x not in sentinels)
         include_intraday = bool(settings.get("include_intraday", False))
         for i, sym in enumerate(symbols):
             if not report.fetched and len(report.errors) >= self.GIVE_UP_AFTER:
@@ -136,7 +175,13 @@ class MarketDataService:
         bench_over = float(bench_over) if bench_over not in (None, "", 0) else None
 
         # ---- stock prices ---------------------------------------------------------------------------------
+        # per stock one merged daily series: manual price history > Yahoo cache > statement period-end closes
+        stmt_pts = statement_price_points(portfolio)
+        skip_download = self.manual_only(settings)
         raw: dict[str, PricePoint] = {}
+        series_by_key: dict[str, PriceSeries] = {}
+        manual_keys: list[str] = []
+        manual_current: list[str] = []
         symbols: dict[str, str] = {}
         yahoo_used = False
         held = portfolio.net_quantities()
@@ -144,8 +189,8 @@ class MarketDataService:
             key = f"{ticker}|{ccy}"
             sym = self.symbol_for(portfolio, settings, ticker, ccy)
             symbols[key] = sym
-            cached: Optional[PricePoint] = None
-            if use_yahoo:
+            yahoo_rows: list[tuple[date, float]] = []
+            if use_yahoo and key not in skip_download:
                 rows = self.store.get_prices(sym)
                 if rows:
                     meta_ccy = (self.store.price_meta(sym).get("currency") or "").upper()
@@ -153,23 +198,39 @@ class MarketDataService:
                         notes.append(f"{ticker}: Yahoo symbol {sym} is quoted in {meta_ccy} but IBKR trades it in "
                                      f"{ccy}; cached prices were ignored - set the correct Yahoo symbol.")
                     else:
-                        cached = PricePoint(rows[-1][1], rows[-1][0], "Yahoo Finance", sym)
-            stmt = stmt_px.get(key)
-            chosen = cached if cached and (stmt is None or cached.day >= stmt.day) else stmt
-            if chosen is None:
+                        yahoo_rows = rows
+            manual_rows = self.store.get_manual_prices(key)
+            if manual_rows:
+                manual_keys.append(key)
+            ser = merge_series([(SRC_MANUAL, manual_rows), (SRC_YAHOO, yahoo_rows),
+                                (SRC_STATEMENT, stmt_pts.get(key, []))], sym)
+            if not len(ser):
                 # worth nothing without shares, and nothing to ask for when the user already typed a price
                 if key not in price_over and not is_closed(held.get((ticker, ccy), 0.0)):
-                    notes.append(f"No price available for {ticker} ({ccy}): refresh online or enter a manual price.")
+                    notes.append(f"No price available for {ticker} ({ccy}): refresh online, add a manual price "
+                                 "history or enter a manual price.")
                 continue
-            yahoo_used |= chosen is cached
-            raw[key] = chosen
+            series_by_key[key] = ser
+            last_day, last_close, last_src = ser.dates[-1], ser.closes[-1], ser.sources[-1]
+            if last_src == SRC_STATEMENT:
+                point = stmt_px.get(key) or PricePoint(last_close, last_day, f"IBKR statement {last_day:%Y-%m-%d}",
+                                                       ticker)
+            else:
+                point = PricePoint(last_close, last_day, SOURCE_LABEL[last_src], sym)
+            yahoo_used |= last_src == SRC_YAHOO
+            if last_src == SRC_MANUAL:
+                manual_current.append(key)
+            raw[key] = point
 
         # ---- FX -------------------------------------------------------------------------------------------
         active = set(portfolio.active_currencies())
         fx_ccys = sorted({c for c in portfolio.currencies() if c != "USD"})
         bench_sym = settings.get("benchmark_symbol") or ""
-        b_rows = self.store.get_prices(bench_sym) if (use_yahoo and bench_sym) else []
-        b_ccy = (self.store.price_meta(bench_sym).get("currency") or "USD").upper() if b_rows else "USD"
+        b_yahoo = self.store.get_prices(bench_sym) if (use_yahoo and bench_sym) else []
+        b_manual = self.store.get_manual_prices(BENCHMARK_KEY)       # quoted like the benchmark (USD unless Yahoo says
+        b_ccy = (self.store.price_meta(bench_sym).get("currency") or "USD").upper() if b_yahoo else "USD"   # otherwise)
+        b_ser = merge_series([(SRC_MANUAL, b_manual), (SRC_YAHOO, b_yahoo)], bench_sym)
+        b_rows = list(zip(b_ser.dates, b_ser.closes))
         if b_rows and b_ccy != "USD" and b_ccy not in fx_ccys:
             fx_ccys.append(b_ccy)
 
@@ -211,11 +272,13 @@ class MarketDataService:
                 usd = []
                 notes.append(f"Benchmark {bench_sym} is quoted in {b_ccy} but no {b_ccy} FX rate is available.")
             if usd:
+                bench_source = ("Manual price history" if b_manual and not b_yahoo else
+                                "Yahoo Finance + manual price history" if b_manual else "Yahoo Finance")
                 bench = BenchSeries(bench_sym, b_ccy, [d for d, _ in b_rows], usd, [v for _, v in b_rows],
-                                    "Yahoo Finance")
+                                    bench_source)
         if not bench.dates and not bench_over:
             notes.append("No benchmark prices yet - the VUAA comparison needs one successful 'Refresh Prices' "
-                         "(or a manual benchmark price).")
+                         "(or a manual benchmark price / price history).")
 
         # ---- as-of date -----------------------------------------------------------------------------------
         held = [f"{t}|{c}" for (t, c), q in portfolio.net_quantities().items() if abs(q) > 1e-9]
@@ -231,6 +294,15 @@ class MarketDataService:
         if missing:
             notes.append("No FX rates for: " + ", ".join(missing) + " (refresh online or enter manual rates).")
 
+        # a held stock whose newest price is far older than the valuation date is valued with stale data - say so
+        # (typical for a manual price history that was typed in once and never extended)
+        for key in pool:
+            pt = raw[key]
+            if (as_of - pt.day).days > STALE_PRICE_DAYS and key not in price_over:
+                notes.append(f"{key.split('|')[0]}: the newest price is from {pt.day} ({pt.source}), {(as_of - pt.day).days} "
+                             f"days before the valuation date {as_of} - add newer prices (Market data > Manual price "
+                             "history) or enter a manual price.")
+
         if not use_yahoo:
             mode = "Statements only (offline mode)"
         elif yahoo_used:
@@ -238,9 +310,12 @@ class MarketDataService:
             mode = f"Yahoo Finance (last refresh {lr}) with statement fallback"
         else:
             mode = "Statements only (no Yahoo data cached yet - press 'Refresh Prices')"
+        if manual_current:
+            mode += f" + manual price history for {len(manual_current)} stock(s)"
 
         return MarketData(
             prices=prices, raw_prices=raw, price_overrides=price_over, fx=fx, fx_latest_raw=latest_raw,
             fx_overrides=fx_over, benchmark=bench, benchmark_override=bench_over, as_of=as_of, mode=mode,
             yahoo_symbols=symbols, missing_fx=missing, notes=notes,
-            last_refresh=self.store.kv_get("last_refresh") or "")
+            last_refresh=self.store.kv_get("last_refresh") or "", price_series=series_by_key,
+            manual_keys=manual_keys)
